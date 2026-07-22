@@ -1,6 +1,6 @@
 ---
 name: review-design-impact
-description: Automatically initialize or incrementally update a local historical-design knowledge base without RAG, find missing business scenarios, review design completeness, infer historically associated impacts, and decompose a change into per-microservice modification obligations. Use when a user naturally asks to initialize historical designs, refresh newly added or changed documents, design a requirement, check a design for omissions, estimate affected scenarios or services, or split a change across microservices. Perform document discovery, history preparation, full-corpus analysis, CodeGraph grounding, and validation internally; do not require the user to run scripts or prepare structured data.
+description: Automatically initialize or incrementally update a local historical-design knowledge base and an offline CodeGraph fact snapshot without RAG, find missing business scenarios, review design completeness, infer historically associated impacts, and decompose a change into per-microservice modification obligations. Use when a user naturally asks to initialize historical designs, refresh new documents or code revisions, design a requirement, check a design for omissions, estimate affected scenarios or services, or split a change across microservices. Perform discovery, history preparation, CodeGraph snapshot preparation, full-corpus analysis, and validation internally; do not require the user to run scripts or prepare structured data.
 ---
 
 # Review design impact
@@ -9,7 +9,7 @@ Provide a natural-language-only interface. The user describes a requirement or a
 
 Never ask the user to run a script, build a database, create JSON, configure RAG, or manually select historical cases. Ask only when no local design corpus can be found or an unresolved business choice would materially change the result.
 
-Treat local historical designs as a complete corpus, not a Top-K retrieval source. Use CodeGraph only after business-impact analysis; absence of a code dependency is not proof of no business impact.
+Treat local historical designs as a complete corpus, not a Top-K retrieval source. Access CodeGraph only while initializing or incrementally updating generated state. During design, review, and decomposition, use only the compiled offline code-fact snapshot. Absence of a code fact is not proof of no business impact.
 
 ## Interpret the request
 
@@ -48,7 +48,9 @@ When multiple unrelated document roots exist and choosing one would change the b
 
 Store generated state under `<workspace>/.design-impact/`. Never modify source design documents.
 
-### 2. Prepare or refresh history automatically
+Read the `code_snapshot_status` and `code_update_required` fields in `.design-impact/session.json` before analysis. The only phases permitted to query CodeGraph are **Initialize history** and **Incremental update**. If a review request finds a missing, stale, or invalid snapshot and CodeGraph is available, temporarily enter incremental-update mode, refresh the snapshot, then resume the review. Never query live CodeGraph from steps 3 through 8.
+
+### 2. Prepare or refresh history and code facts automatically
 
 Read `.design-impact/session.json` produced by `workspace_state.py`.
 
@@ -70,7 +72,15 @@ If the initial corpus is large, provide brief progress updates and continue in b
 
 After all pending documents are processed and verified, run `scripts/compile_history.py` internally to rebuild `.design-impact/history.db` and its quality report. SQLite is generated state; extracted cases and original documents remain the evidence sources.
 
-When initialization or incremental update is the user's primary request, stop after successful compilation and report document counts, reused and re-extracted counts, failures, trusted/candidate/conflict/rejected case counts, compiled scenario/service counts, the human-review queue, and the state location. Do not require a design-review request in the same turn.
+Read [references/code-fact-schema.md](references/code-fact-schema.md). When CodeGraph is available, prepare the code-fact snapshot in this phase only:
+
+- On full initialization, export the business-impact projection for every in-scope repository, including repository path, branch, commit, index time, covered surfaces, uncovered surfaces, services, APIs, events, tables, jobs, entry points, and their relations.
+- On incremental update, compare current repository branch and commit with `.design-impact/code-manifest.json`; query CodeGraph only for added or changed repositories and changed graph content, then rebuild the consolidated export.
+- Compile the export with `scripts/compile_code_facts.py` into `.design-impact/code-facts.db`, `.design-impact/code-manifest.json`, and `.design-impact/code-coverage.json`.
+- Preserve repository, branch, commit, file location, and CodeGraph evidence in every compiled fact. Record partial indexing and unsupported technical surfaces instead of implying full coverage.
+- If CodeGraph is unavailable, do not block historical-document initialization. Record the snapshot as unavailable and make that evidence limitation explicit.
+
+When initialization or incremental update is the user's primary request, stop after successful compilation and report document counts, reused and re-extracted counts, failures, trusted/candidate/conflict/rejected case counts, compiled scenario/service counts, the human-review queue, CodeGraph snapshot repositories and commits, snapshot coverage gaps, and the state location. Do not require a design-review request in the same turn.
 
 ### 3. Build the current ChangeSpec
 
@@ -98,6 +108,8 @@ Use knowledge tiers in every conclusion:
 - `conflict` evidence must become an explicit design question with all sides shown.
 - `rejected` evidence must not influence design conclusions.
 
+Read `.design-impact/code-facts.db`, `.design-impact/code-manifest.json`, and `.design-impact/code-coverage.json` as immutable inputs for this review. Do not access CodeGraph or inspect live code repositories. Use positive snapshot facts to confirm historical candidates or add technical candidates. Never remove a historically or semantically supported candidate because the snapshot has no corresponding entity or relation.
+
 ### 5. Expand expected scenarios
 
 Read [references/scenario-rules.md](references/scenario-rules.md). Form the union of:
@@ -106,7 +118,7 @@ Read [references/scenario-rules.md](references/scenario-rules.md). Form the unio
 - version additions and known historical omissions;
 - applicable lifecycle, state, concurrency, failure, compatibility, permission, operations, data, and observability scenarios;
 - business associations not represented in code;
-- CodeGraph readers, writers, producers, consumers, jobs, and alternate entry points when CodeGraph is available.
+- readers, writers, producers, consumers, jobs, and alternate entry points present in the offline code-fact snapshot.
 
 Prune a historically supported scenario only with an explicit non-applicability reason.
 
@@ -118,7 +130,7 @@ Read [references/service-decomposition.md](references/service-decomposition.md).
 
 Also define cross-service truth ownership, consistency, failure behavior, compensation, version skew, publish order, migration, and rollback.
 
-Use CodeGraph to locate and verify concrete implementation points after this baseline exists. Keep historically or semantically supported candidates when no direct code path is found; mark them for confirmation.
+Use only the offline code-fact snapshot to locate concrete implementation points. Keep historically or semantically supported candidates when no matching snapshot fact is found; mark them for confirmation and distinguish `not-found-in-snapshot` from `proven-not-applicable`.
 
 ### 7. Challenge the result
 
@@ -148,7 +160,7 @@ Lead with the useful result:
 3. Per-microservice modification matrix.
 4. Cross-service consistency, release, and rollback issues.
 5. Only the open questions that require a human decision.
-6. Traceable historical-document and CodeGraph evidence.
+6. Traceable historical-document evidence and offline code-fact evidence with repository, branch, commit, and coverage status.
 
 Keep severity separate from confidence. Label general-rule-only findings `unverified`. Do not treat a completeness score, repeated wording, or document majority as proof that the design is complete.
 
@@ -157,5 +169,7 @@ Keep severity separate from confidence. Label general-rule-only findings `unveri
 - If generated state is absent, initialize it automatically.
 - If source hashes changed, refresh only affected cases and rebuild generated aggregates.
 - If a case is invalid, repair or re-extract it from the source document.
-- If CodeGraph is unavailable, complete the business review and identify code grounding as unavailable.
+- If the code snapshot is missing, stale, or invalid and CodeGraph is available, refresh it in incremental-update mode before review.
+- If snapshot freshness is unknown because local repository revisions cannot be inspected, do not enter a refresh loop. Use the snapshot with an explicit `unknown` freshness label.
+- If CodeGraph is unavailable, complete the business review and identify offline code grounding as unavailable or stale. Never substitute a live repository inspection during review.
 - If a document cannot be parsed, report that specific evidence gap without blocking analysis of the rest of the corpus.

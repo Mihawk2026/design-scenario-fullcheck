@@ -182,6 +182,82 @@ class PipelineTest(unittest.TestCase):
             self.assertEqual(quality["knowledge_tier_counts"]["conflict"], 1)
             self.assertEqual(len(quality["human_review_queue"]), 1)
 
+            code_export = {
+                "schema_version": 1,
+                "generated_at": "2026-07-22T10:00:00+00:00",
+                "repositories": [
+                    {
+                        "name": "order-service",
+                        "branch": "main",
+                        "commit": "abc123",
+                        "indexed_at": "2026-07-22T09:55:00+00:00",
+                        "coverage": ["source-code", "sql"],
+                        "not_covered": ["scheduler-platform"],
+                    }
+                ],
+                "entities": [
+                    {
+                        "id": "order-service:CloseExpiredOrderJob",
+                        "type": "scheduled-job",
+                        "name": "CloseExpiredOrderJob",
+                        "service": "order-service",
+                        "repository": "order-service",
+                        "location": {"file": "src/jobs/CloseExpiredOrderJob.java", "line": 42},
+                        "evidence": {"kind": "codegraph", "confidence": "high"},
+                    }
+                ],
+                "relations": [
+                    {
+                        "source_id": "order-service:CloseExpiredOrderJob",
+                        "type": "reads-state",
+                        "target_id": "order-service:Order.status",
+                        "repository": "order-service",
+                        "evidence": {"kind": "codegraph"},
+                    }
+                ],
+                "business_mappings": [
+                    {
+                        "business_object": "订单",
+                        "state": "WAIT_PAY",
+                        "action": "自动关单",
+                        "asset_id": "order-service:CloseExpiredOrderJob",
+                        "confidence": "high",
+                        "evidence": {"kind": "codegraph"},
+                    }
+                ],
+            }
+            code_export_path = root / "code-export.json"
+            code_export_path.write_text(
+                json.dumps(code_export, ensure_ascii=False), encoding="utf-8"
+            )
+            code_database = state / "code-facts.db"
+            code_compile = run_script(
+                "compile_code_facts.py",
+                "--input",
+                str(code_export_path),
+                "--output",
+                str(code_database),
+            )
+            self.assertEqual(code_compile.returncode, 0, code_compile.stderr)
+            self.assertTrue(code_database.is_file())
+            self.assertTrue((state / "code-manifest.json").is_file())
+            self.assertTrue((state / "code-coverage.json").is_file())
+            code_manifest = json.loads(
+                (state / "code-manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(code_manifest["repositories"][0]["commit"], "abc123")
+
+            snapshot_state = run_script(
+                "workspace_state.py",
+                "--workspace",
+                str(root),
+            )
+            self.assertEqual(snapshot_state.returncode, 0, snapshot_state.stderr)
+            session = json.loads((state / "session.json").read_text(encoding="utf-8"))
+            self.assertEqual(session["code_snapshot_status"], "unknown")
+            self.assertFalse(session["code_update_required"])
+            self.assertNotIn("refresh_code_snapshot", session["next_actions"])
+
             spec = {
                 "title": "订单增加冻结能力",
                 "before_behaviors": ["订单可以支付"],

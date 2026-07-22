@@ -41,7 +41,7 @@ Define:
 
 ## Status guidance
 
-- Use `confirmed` when the current design or CodeGraph explicitly supports the change.
+- Use `confirmed` when the current design or a fresh offline code-fact snapshot explicitly supports the change.
 - Use `historical-candidate` when comparable historical cases repeatedly changed the service.
 - Use `unverified` when supported only by a general rule or weak association.
 - Use `not-applicable` only with a business or architectural explanation.

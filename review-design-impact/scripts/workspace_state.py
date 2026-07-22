@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -82,6 +84,125 @@ def load_manifest(path: Path) -> dict[str, Any]:
         return value if isinstance(value, dict) else {}
     except (OSError, UnicodeError, json.JSONDecodeError):
         return {}
+
+
+def git_value(repository: Path, *arguments: str) -> str | None:
+    git = shutil.which("git")
+    if not git:
+        return None
+    try:
+        result = subprocess.run(
+            [git, "-C", str(repository), *arguments],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def same_commit(expected: str, actual: str) -> bool:
+    expected = expected.casefold()
+    actual = actual.casefold()
+    return actual.startswith(expected) or expected.startswith(actual)
+
+
+def inspect_code_snapshot(state_dir: Path) -> dict[str, Any]:
+    database = state_dir / "code-facts.db"
+    manifest_path = state_dir / "code-manifest.json"
+    coverage_path = state_dir / "code-coverage.json"
+    snapshot: dict[str, Any] = {
+        "status": "missing",
+        "database": str(database),
+        "manifest": str(manifest_path),
+        "coverage": str(coverage_path),
+        "repositories": [],
+        "issues": [],
+    }
+    if not database.is_file() and not manifest_path.is_file():
+        snapshot["issues"].append("offline code-fact snapshot has not been initialized")
+        return snapshot
+    if not database.is_file() or not manifest_path.is_file() or not coverage_path.is_file():
+        snapshot["status"] = "invalid"
+        snapshot["issues"].append("offline code-fact snapshot is incomplete")
+        return snapshot
+
+    manifest = load_manifest(manifest_path)
+    repositories = manifest.get("repositories")
+    if not manifest or not isinstance(repositories, list):
+        snapshot["status"] = "invalid"
+        snapshot["issues"].append("code-manifest.json is invalid")
+        return snapshot
+    if not repositories:
+        snapshot["status"] = "unknown"
+        snapshot["issues"].append("code snapshot contains no repositories")
+        return snapshot
+
+    saw_unknown = False
+    saw_stale = False
+    for repository in repositories:
+        if not isinstance(repository, dict):
+            snapshot["status"] = "invalid"
+            snapshot["issues"].append("code manifest contains a non-object repository")
+            return snapshot
+        name = repository.get("name")
+        expected_branch = repository.get("branch")
+        expected_commit = repository.get("commit")
+        path_value = repository.get("path")
+        detail = {
+            "name": name,
+            "path": path_value,
+            "snapshot_branch": expected_branch,
+            "snapshot_commit": expected_commit,
+            "status": "unknown",
+        }
+        if not all(isinstance(value, str) and value for value in (name, expected_branch, expected_commit)):
+            snapshot["status"] = "invalid"
+            snapshot["issues"].append("code manifest repository identity is incomplete")
+            return snapshot
+        if not isinstance(path_value, str) or not path_value:
+            saw_unknown = True
+            detail["reason"] = "local repository path is not recorded"
+            snapshot["repositories"].append(detail)
+            continue
+        repository_path = Path(path_value)
+        if not repository_path.is_dir():
+            saw_unknown = True
+            detail["reason"] = "local repository path is unavailable"
+            snapshot["repositories"].append(detail)
+            continue
+
+        actual_commit = git_value(repository_path, "rev-parse", "HEAD")
+        actual_branch = git_value(repository_path, "rev-parse", "--abbrev-ref", "HEAD")
+        dirty = git_value(repository_path, "status", "--porcelain")
+        detail["current_branch"] = actual_branch
+        detail["current_commit"] = actual_commit
+        detail["dirty"] = bool(dirty)
+        if actual_commit is None or actual_branch is None or dirty is None:
+            saw_unknown = True
+            detail["reason"] = "local repository revision could not be inspected"
+        elif (
+            not same_commit(expected_commit, actual_commit)
+            or (expected_branch not in {"HEAD", "detached"} and expected_branch != actual_branch)
+            or bool(dirty)
+        ):
+            saw_stale = True
+            detail["status"] = "stale"
+            detail["reason"] = "branch, commit, or working tree differs from the snapshot"
+        else:
+            detail["status"] = "fresh"
+        snapshot["repositories"].append(detail)
+
+    snapshot["status"] = "stale" if saw_stale else "unknown" if saw_unknown else "fresh"
+    if saw_stale:
+        snapshot["issues"].append("one or more repositories changed after snapshot creation")
+    elif saw_unknown:
+        snapshot["issues"].append("one or more repository revisions could not be verified")
+    return snapshot
 
 
 def iter_case_objects(path: Path) -> Iterable[dict[str, Any]]:
@@ -281,6 +402,14 @@ def main() -> int:
         or latest_case_mtime > database.stat().st_mtime
         or bool(removed)
     )
+    code_snapshot = inspect_code_snapshot(state_dir)
+    code_snapshot_status = code_snapshot["status"]
+    code_update_required = code_snapshot_status in {"missing", "stale", "invalid"}
+    code_update_action = (
+        "initialize_code_snapshot"
+        if code_snapshot_status == "missing"
+        else "refresh_code_snapshot"
+    )
 
     session = {
         "schema_version": 1,
@@ -295,6 +424,9 @@ def main() -> int:
         "needs_compile": needs_compile,
         "history_db": str(database),
         "history_db_exists": database.is_file(),
+        "code_snapshot": code_snapshot,
+        "code_snapshot_status": code_snapshot_status,
+        "code_update_required": code_update_required,
         "errors": [*errors, *case_errors],
         "next_actions": [
             *( ["extract_pending_documents"] if pending else [] ),
@@ -304,6 +436,7 @@ def main() -> int:
                 if needs_compile and not pending and not pending_validation
                 else []
             ),
+            *( [code_update_action] if code_update_required else [] ),
             *(
                 ["analyze_current_change"]
                 if not pending and not pending_validation
@@ -326,6 +459,8 @@ def main() -> int:
                 "pending_validation": len(pending_validation),
                 "case_files": case_file_count,
                 "needs_compile": needs_compile,
+                "code_snapshot_status": code_snapshot_status,
+                "code_update_required": code_update_required,
                 "errors": len(session["errors"]),
                 "session": str(session_path),
             },

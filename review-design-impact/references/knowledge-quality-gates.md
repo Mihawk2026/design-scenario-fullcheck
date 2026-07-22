@@ -101,6 +101,6 @@ Send only high-value items for human review:
 - uncertain alias merges or splits;
 - unclear final version;
 - inferred claims proposed for promotion;
-- historical design that conflicts with current CodeGraph behavior.
+- historical design that conflicts with the latest initialized or incrementally updated offline code-fact snapshot.
 
 Do not require people to review every clear, explicitly evidenced case.
