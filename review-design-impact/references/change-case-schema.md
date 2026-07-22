@@ -10,6 +10,7 @@ Use this schema to extract historical design facts. Preserve evidence for every 
   "title": "订单增加人工冻结能力",
   "source": {
     "path": "D:/designs/order-freeze-v2.docx",
+    "sha256": "document-sha256",
     "version": "V2",
     "sections": ["4.3 服务改造"]
   },
@@ -87,4 +88,4 @@ Use this schema to extract historical design facts. Preserve evidence for every 
 
 ## Validation minimum
 
-Every case must contain non-empty `case_id`, `title`, `source.path`, `business_objects`, `change_types`, and at least one of `scenarios` or `service_changes`.
+Every case must contain non-empty `case_id`, `title`, `source.path`, `source.sha256`, `business_objects`, `change_types`, and at least one of `scenarios` or `service_changes`. `source.sha256` allows the skill to refresh only documents that changed.

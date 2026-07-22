@@ -1,4 +1,6 @@
 interface:
   display_name: "Design Scenario Full Check"
-  short_description: "Check design scenarios and microservice impacts"
-  default_prompt: "Use $review-design-impact to review this design for missing scenarios and decompose changes by microservice."
+  short_description: "Automatically check design scenarios and service impacts"
+  default_prompt: "使用 $review-design-impact 检查这个设计遗漏了哪些场景，并按微服务给出修改点。"
+policy:
+  allow_implicit_invocation: true

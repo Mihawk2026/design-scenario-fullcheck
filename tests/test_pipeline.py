@@ -27,10 +27,21 @@ class PipelineTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw_temp:
             root = Path(raw_temp)
             docs = root / "docs"
-            cases = root / "cases"
+            state = root / ".design-impact"
+            cases = state / "cases"
             docs.mkdir()
-            cases.mkdir()
             (docs / "order-freeze-v1.md").write_text("# 订单冻结设计", encoding="utf-8")
+
+            workspace_result = run_script(
+                "workspace_state.py",
+                "--workspace",
+                str(root),
+            )
+            self.assertEqual(workspace_result.returncode, 0, workspace_result.stderr)
+            session = json.loads((state / "session.json").read_text(encoding="utf-8"))
+            self.assertEqual(session["document_count"], 1)
+            self.assertEqual(len(session["pending_extraction"]), 1)
+            self.assertEqual(session["discovery_mode"], "design-name-or-directory")
 
             manifest = root / "manifest.json"
             inventory = run_script(
@@ -43,11 +54,16 @@ class PipelineTest(unittest.TestCase):
             self.assertEqual(inventory.returncode, 0, inventory.stderr)
             manifest_data = json.loads(manifest.read_text(encoding="utf-8"))
             self.assertEqual(len(manifest_data["documents"]), 1)
+            source_hash = manifest_data["documents"][0]["sha256"]
 
             change_case = {
                 "case_id": "order-freeze-v1",
                 "title": "订单冻结",
-                "source": {"path": str(docs / "order-freeze-v1.md"), "version": "V1"},
+                "source": {
+                    "path": str(docs / "order-freeze-v1.md"),
+                    "sha256": source_hash,
+                    "version": "V1",
+                },
                 "domain": "交易",
                 "business_objects": ["订单"],
                 "capabilities": ["订单生命周期"],
@@ -84,6 +100,15 @@ class PipelineTest(unittest.TestCase):
             (cases / "order-freeze-v1.json").write_text(
                 json.dumps(change_case, ensure_ascii=False), encoding="utf-8"
             )
+
+            refreshed_state = run_script(
+                "workspace_state.py",
+                "--workspace",
+                str(root),
+            )
+            self.assertEqual(refreshed_state.returncode, 0, refreshed_state.stderr)
+            session = json.loads((state / "session.json").read_text(encoding="utf-8"))
+            self.assertEqual(session["pending_extraction"], [])
 
             database = root / "history.db"
             compile_result = run_script(

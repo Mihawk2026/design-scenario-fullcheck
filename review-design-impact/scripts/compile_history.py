@@ -74,6 +74,8 @@ def validate_case(case: dict[str, Any], origin: Path) -> list[str]:
         errors.append("title must be a non-empty string")
     if not isinstance(source, dict) or not isinstance(source.get("path"), str):
         errors.append("source.path must be a string")
+    elif not isinstance(source.get("sha256"), str) or not source.get("sha256", "").strip():
+        errors.append("source.sha256 must be a non-empty string")
     for field in TERM_FIELDS:
         try:
             require_list(case, field)

@@ -1,264 +1,186 @@
 # Design Scenario Full Check
 
-`review-design-impact` 是一个面向 AI 辅助系统设计的 SKILL。它直接分析本地全部历史设计文档，将设计中的业务变化、场景、微服务和修改点编译为本地结构化知识库，然后检查新设计是否遗漏业务场景或跨服务修改。
+一个面向 AI 辅助系统设计的 SKILL：自动读取本地历史设计，检查当前需求或设计遗漏的业务场景，并按微服务拆分修改点。
 
-它不使用向量检索、文档切片召回或 Top-K RAG。每次影响分析都会遍历全部已经结构化的历史案例。CodeGraph 只负责最后的代码定位和技术验证。
+用户不需要配置 RAG、创建数据库、整理 JSON 或运行脚本。安装后直接用自然语言描述任务即可。
 
-## 解决的问题
+## 直接使用
 
-- AI 只看到代码依赖，遗漏业务上有关联、代码上无调用关系的系统。
-- AI 能生成主流程，但容易漏掉并发、异常、兼容、运营、报表或回滚场景。
-- 一个需求需要拆给多个微服务，但修改点分散且缺少统一检查。
-- 历史设计很多，但整篇文档直接塞入上下文成本高、结果不稳定。
-
-## 工作原理
+可以这样说：
 
 ```text
-本地历史设计文档
-  → 全量清单和版本识别
-  → AI逐份抽取结构化 ChangeCase
-  → compile_history.py 编译 SQLite
-  → 新需求生成 ChangeSpec
-  → analyze_impact.py 全库扫描
-  → 场景覆盖和微服务修改检查
-  → CodeGraph 定位验证
-  → validate_review.py 完整性门禁
+使用 $review-design-impact 检查这份设计有没有遗漏场景。
 ```
-
-历史设计形成“变更超边”：同一历史需求涉及的业务对象、状态、场景、服务、API、消息、任务、后台、报表和历史遗漏会被保存在同一个 ChangeCase 中。即使这些服务在代码上没有依赖，也能通过历史共同变更关系被发现。
-
-## 目录
 
 ```text
-review-design-impact/
-├─ SKILL.md
-├─ agents/openai.yaml
-├─ references/
-│  ├─ change-case-schema.md
-│  ├─ change-spec-schema.md
-│  ├─ scenario-rules.md
-│  ├─ service-decomposition.md
-│  └─ report-schema.md
-└─ scripts/
-   ├─ inventory_documents.py
-   ├─ compile_history.py
-   ├─ analyze_impact.py
-   └─ validate_review.py
+设计订单冻结能力，参考本地全部历史设计，给出完整影响范围和每个微服务的修改点。
 ```
-
-## 安装 SKILL
-
-将 `review-design-impact` 文件夹复制到 Codex skills 目录：
-
-```powershell
-Copy-Item -Recurse -Force .\review-design-impact "$env:CODEX_HOME\skills\review-design-impact"
-```
-
-如果没有设置 `CODEX_HOME`，通常使用：
-
-```powershell
-Copy-Item -Recurse -Force .\review-design-impact "$HOME\.codex\skills\review-design-impact"
-```
-
-重新加载 Codex 后，可显式调用：
 
 ```text
-使用 $review-design-impact 检查这份设计遗漏了哪些业务场景，并按微服务拆分修改点。
+这个需求会影响哪些业务场景？需要拆给哪些微服务？
 ```
-
-也可以直接提出下列需求触发它：
-
-- “设计订单冻结功能，先分析完整影响范围。”
-- “检查这份设计有没有遗漏场景。”
-- “这个需求需要哪些微服务配合修改？”
-- “用全部历史设计检查当前方案。”
-
-## 准备本地历史文档
-
-### 1. 生成全量文档清单
-
-```powershell
-python .\review-design-impact\scripts\inventory_documents.py `
-  --root D:\designs\order `
-  --root D:\designs\payment `
-  --output D:\design-impact\manifest.json
-```
-
-默认记录 Markdown、文本、HTML、JSON、YAML、Word 和 PDF 文件的路径、大小、修改时间、SHA-256 和可能的版本号。该脚本只负责盘点，不把二进制文档内容粗暴转换为文本。
-
-再次执行时增加旧清单，可以得到新增、变化、未变化和删除文件：
-
-```powershell
-python .\review-design-impact\scripts\inventory_documents.py `
-  --root D:\designs `
-  --previous D:\design-impact\manifest.json `
-  --output D:\design-impact\manifest-new.json
-```
-
-### 2. 逐份抽取 ChangeCase
-
-让 AI 按 `references/change-case-schema.md` 分析清单中的每份设计，将结果保存到一个案例目录：
 
 ```text
-D:\design-impact\cases\
-├─ order-freeze-v1.json
-├─ order-freeze-v2.json
-└─ refund-rule-change.json
+历史设计在 D:\designs，检查当前方案是否完整。
 ```
 
-重要要求：
-
-- 一份文档可以包含多个 ChangeCase。
-- 保留原文件、版本、章节或页码证据。
-- 区分原文明示内容和 AI 推断内容。
-- 用 `supersedes` 关联版本。
-- 将V2比V1新增的内容标为“版本补充候选”，不要自动认定为遗漏。
-- 统一服务别名和业务术语，例如 `订单中心`、`order-svc`、`order-service`。
-
-### 3. 编译本地 SQLite
-
-```powershell
-python .\review-design-impact\scripts\compile_history.py `
-  --cases D:\design-impact\cases `
-  --output D:\design-impact\history.db
-```
-
-编译器会校验案例结构，并生成：
-
-- 历史案例表。
-- 业务对象、能力、动作、状态和变化类型索引。
-- 场景表。
-- 微服务修改点表。
-- 历史遗漏表。
-- 服务共同变更统计。
-
-只要任何案例不合法，编译默认失败，避免不完整知识悄悄进入正式数据库。
-
-## 分析一个新需求
-
-先让 AI 根据 `references/change-spec-schema.md` 生成 `change-spec.json`：
-
-```json
-{
-  "title": "订单增加冻结能力",
-  "before_behaviors": ["待支付订单可以支付或自动关闭"],
-  "after_behaviors": ["待支付订单可以被冻结"],
-  "business_objects": ["订单"],
-  "capabilities": ["订单生命周期管理"],
-  "change_types": ["新增状态", "新增操作"],
-  "actions": ["冻结", "解冻"],
-  "states": ["FROZEN"],
-  "actors": ["客服", "风控系统"],
-  "triggers": ["人工操作", "风控事件"],
-  "changed_rules": ["冻结期间禁止支付"],
-  "invariants": ["订单不能同时支付成功和冻结成功"],
-  "non_goals": [],
-  "unknowns": []
-}
-```
-
-运行全库影响分析：
-
-```powershell
-python .\review-design-impact\scripts\analyze_impact.py `
-  --db D:\design-impact\history.db `
-  --change-spec D:\design-impact\change-spec.json `
-  --output D:\design-impact\impact.json
-```
-
-可选的别名文件为普通 JSON：
-
-```json
-{
-  "order-svc": "order-service",
-  "订单中心": "order-service",
-  "订单单据": "订单"
-}
-```
-
-```powershell
-python .\review-design-impact\scripts\analyze_impact.py `
-  --db D:\design-impact\history.db `
-  --change-spec D:\design-impact\change-spec.json `
-  --aliases D:\design-impact\aliases.json `
-  --output D:\design-impact\impact.json
-```
-
-输出包含总案例数、全部匹配案例及原因、历史场景、候选服务、历史修改点、服务共同变更和历史遗漏。脚本不使用相似度，也没有 Top-K 参数。
-
-## 检查设计并拆分微服务
-
-将当前设计和 `impact.json` 一起交给 `$review-design-impact`。SKILL会输出：
-
-1. ChangeSpec摘要。
-2. 场景覆盖矩阵。
-3. 历史案例和版本差异证据。
-4. 每个微服务的参与原因及修改点。
-5. 跨服务一致性、发布顺序和回滚检查。
-6. 缺失、部分覆盖、冲突和待确认项。
-7. 本地文档及CodeGraph证据链。
-
-每个场景只能使用以下状态：
-
-- `covered`
-- `partial`
-- `missing`
-- `conflict`
-- `unverified`
-- `not-applicable`
-
-完成后保存机器可读结果并执行：
-
-```powershell
-python .\review-design-impact\scripts\validate_review.py `
-  --input D:\design-impact\review.json
-```
-
-校验失败时不能宣称设计检查完成。
-
-## CodeGraph接入原则
-
-本项目不绑定某个具体 CodeGraph 产品。接入时需要能够查询：
-
-- 服务、API、表、字段、状态和事件对应的代码节点。
-- 字段和状态的读写方。
-- API调用方和消息消费者。
-- 定时任务、异步任务和配置入口。
-
-调用顺序必须是：
+如果设计文档已经附在对话中，直接说：
 
 ```text
-历史业务影响分析 → 候选场景和服务 → CodeGraph定位验证
+检查这份设计。
 ```
 
-不能用 CodeGraph 查不到依赖作为删除候选服务的理由。
+SKILL 会理解用户是在设计、审查还是拆分服务，不要求用户选择运行模式。
 
-## 增量更新
+## SKILL会自动完成什么
 
-历史文档变化后：
+第一次使用时自动：
 
-1. 重新生成 manifest，并与旧 manifest 比较。
-2. 只重新抽取 `added` 和 `changed` 文档。
-3. 删除或停用 `removed` 文档对应的案例。
-4. 使用全部案例重新执行 `compile_history.py`。
-5. 运行历史回放测试。
+1. 在当前工作区发现历史设计文档。
+2. 识别 Markdown、文本、HTML、JSON、YAML、Word 和 PDF。
+3. 逐份提取业务对象、状态、操作、场景、微服务和修改点。
+4. 把历史设计整理成可复用的结构化变更案例。
+5. 建立本地业务关联和历史共同变更关系。
+6. 检查当前设计的场景覆盖。
+7. 按微服务生成修改清单。
+8. 如果有 CodeGraph，再验证具体代码落点。
+9. 运行完整性门禁后输出结果。
 
-SQLite是可重新生成产物，建议不要作为唯一知识源；原始设计文档和结构化案例JSON才是事实来源。
+再次使用时自动：
 
-## 推荐验收方法
+- 复用未变化的历史分析结果。
+- 只重新分析新增或修改过的文档。
+- 自动更新本地知识和检查结果。
+- 不要求用户维护索引或执行更新命令。
 
-选择一批有V1、V2或后续事故记录的历史设计：
+## 输出示例
 
-1. 只输入当时的V1设计。
-2. 不向检查过程泄露V2和事故结论。
-3. 使用其他历史案例和通用规则执行检查。
-4. 验证是否命中V2补充或事故暴露的真实遗漏。
+SKILL优先给出业务结果，而不是内部处理步骤：
 
-重点统计严重遗漏召回率、真实遗漏命中率、影响服务召回率、误报率和人工评审耗时。不要用报告长度或模型自评作为效果指标。
+### 高风险遗漏
 
-## 当前边界
+| 场景 | 问题 | 后果 | 建议 |
+|---|---|---|---|
+| 冻结与支付并发 | 未定义最终状态 | 订单可能同时冻结并支付成功 | 定义状态竞争规则和原子校验 |
+| 冻结期间自动关单 | 定时任务未适配 | 冻结订单可能被错误关闭 | 修改关单过滤并增加测试 |
 
-- 文档内容抽取由AI或已有文档解析能力完成，确定性脚本不负责理解Word/PDF业务语义。
-- 术语不统一会降低精确匹配效果，应维护别名和规范名称。
-- 历史共同出现表示“需要检查”，不自动表示“本次必须修改”。
-- 仅由通用规则推导且没有历史、业务关系或代码证据的结论必须标为 `unverified`。
+### 微服务修改点
+
+| 服务 | 参与原因 | 修改点 |
+|---|---|---|
+| order-service | 订单状态真相源 | 状态机、冻结接口、幂等和并发控制 |
+| payment-service | 支付许可依赖订单状态 | 支付前校验、错误码、并发测试 |
+| scheduler-service | 自动关单读取订单状态 | 排除冻结状态、增加监控 |
+
+结果还会包含：
+
+- 已覆盖、部分覆盖、缺失、冲突和待确认场景。
+- 跨服务一致性、失败补偿、发布顺序和回滚检查。
+- 历史设计原文及 CodeGraph 证据。
+- 只保留必须由人决定的问题。
+
+## 文档在哪里
+
+默认从当前工作区自动发现设计文档，优先识别名称或目录中包含以下关键词的内容：
+
+```text
+design、docs、architecture、ADR、RFC、设计、方案、架构、改造、需求
+```
+
+如果历史文档在工作区外，用户只需在自然语言里说一次路径：
+
+```text
+历史设计在 D:\company-designs，用它们检查这个需求。
+```
+
+找不到历史文档，或者存在多个完全无关的文档库且选择会影响结论时，SKILL才会提问。
+
+## 本地状态
+
+SKILL自动在当前工作区创建：
+
+```text
+.design-impact/
+├─ manifest.json
+├─ session.json
+├─ cases/
+├─ history.db
+├─ current-change.json
+└─ reports/
+```
+
+这些都是自动管理的内部状态，普通用户不需要打开或修改。SKILL不会改写原始历史设计。
+
+建议把 `.design-impact/` 加入业务项目的 `.gitignore`，除非团队希望共享结构化历史案例。
+
+## 安装
+
+将仓库中的 `review-design-impact` 文件夹安装到 Codex skills 目录即可。也可以直接让 Codex 完成安装：
+
+```text
+从 https://github.com/Mihawk2026/design-scenario-fullcheck 安装 review-design-impact skill。
+```
+
+安装后可显式使用 `$review-design-impact`；SKILL也允许在“检查设计遗漏”“分析影响场景”“拆分微服务修改点”等请求中自动触发。
+
+## 核心原则
+
+### 不使用RAG
+
+本项目不进行向量检索、文档切片召回或 Top-K 筛选。历史文档会被全量结构化，当前变化会和全部历史案例进行条件匹配和业务关联分析。
+
+### 不把CodeGraph当成业务影响范围
+
+代码上没有调用关系的服务，可能因为同一个业务状态、规则、运营流程或数据口径而必须一起修改。因此顺序固定为：
+
+```text
+业务变化分析 → 历史场景和服务关联 → 完整影响清单 → CodeGraph定位验证
+```
+
+### 不把推测包装成结论
+
+- 历史设计明确支持：标记历史证据。
+- 重复共同变更支持：标记业务关联候选。
+- CodeGraph支持：标记代码证据。
+- 只有通用规则支持：标记 `unverified`。
+
+严重程度和置信度分别评估。
+
+## CodeGraph是可选能力
+
+没有 CodeGraph 时，SKILL仍然可以完成业务场景检查和微服务影响分析，只会把具体代码落点标记为未验证。
+
+接入 CodeGraph 后，建议提供以下查询能力：
+
+- 服务、接口、表、字段、状态和事件对应的代码节点。
+- API调用方、消息生产者和消费者。
+- 字段、状态和业务枚举的读写方。
+- 定时任务、异步任务、配置和数据同步入口。
+
+## 维护者说明
+
+普通使用不需要运行下面的脚本。它们由 SKILL 自动调用：
+
+| 脚本 | 内部职责 |
+|---|---|
+| `workspace_state.py` | 自动发现文档、维护隐藏状态并确定待分析文件 |
+| `inventory_documents.py` | 生成文件哈希和增量变化清单 |
+| `compile_history.py` | 将结构化历史案例编译为本地 SQLite |
+| `analyze_impact.py` | 遍历全部案例并汇总场景、服务和历史遗漏 |
+| `validate_review.py` | 执行结果完整性门禁 |
+
+结构化规范位于 `review-design-impact/references/`，SKILL按需读取，避免把全部规则长期放入上下文。
+
+## 验收建议
+
+使用带有V1、V2或后续事故记录的历史设计进行回放：只给检查过程V1设计，看它是否能利用其他历史案例发现V2补充或事故暴露的问题。
+
+重点关注：
+
+- 严重遗漏召回率。
+- 真实遗漏命中率。
+- 影响服务召回率。
+- 误报率。
+- 人工评审耗时。
+
+不要用报告长度或模型自评分数作为效果指标。
