@@ -1,0 +1,4 @@
+interface:
+  display_name: "Design Scenario Full Check"
+  short_description: "Check design scenarios and microservice impacts"
+  default_prompt: "Use $review-design-impact to review this design for missing scenarios and decompose changes by microservice."
