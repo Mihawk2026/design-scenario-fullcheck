@@ -52,20 +52,25 @@ Store generated state under `<workspace>/.design-impact/`. Never modify source d
 
 Read `.design-impact/session.json` produced by `workspace_state.py`.
 
+Read [references/knowledge-quality-gates.md](references/knowledge-quality-gates.md) before extracting or promoting historical knowledge. Treat historical documents as evidence, not ground truth.
+
 - Reuse unchanged extracted cases.
 - Analyze every document in `pending_extraction` without asking the user to preprocess it.
 - Use available document or PDF extraction capabilities for binary formats.
-- Extract one or more ChangeCase objects per document using [references/change-case-schema.md](references/change-case-schema.md).
-- Preserve source path, SHA-256, version, section or page, and explicit-versus-inferred evidence.
+- In pass 1, extract one or more document-local ChangeCase objects using [references/change-case-schema.md](references/change-case-schema.md). Do not use other documents to fill omissions in the source document.
+- Preserve original terms, source path, SHA-256, version, section or page, and explicit-versus-inferred evidence.
+- In pass 2, independently reread the source and verify each object, scenario, service change, relation, and evidence location. Do not validate from the extracted JSON alone.
+- Mark each case `validated`, `partial`, `unverified`, `conflict`, or `rejected`; record validation issues and confidence.
 - Write cases under `.design-impact/cases/` and checkpoint after each document.
 - Link versions with `supersedes`; treat later additions as review candidates, not automatic omissions.
-- Normalize business-object, capability, action, state, service, and asset aliases encountered in the corpus.
+- Normalize terms only after document-local extraction. Preserve original terms and compare behavior signatures before merging aliases.
+- Keep contradictory conclusions and their applicability conditions. Never resolve conflicts by majority count alone.
 
 If the initial corpus is large, provide brief progress updates and continue in batches. Do not transfer pipeline operation to the user.
 
-After all pending documents are processed, run `scripts/compile_history.py` internally to rebuild `.design-impact/history.db`. SQLite is generated state; extracted cases and original documents remain the evidence sources.
+After all pending documents are processed and verified, run `scripts/compile_history.py` internally to rebuild `.design-impact/history.db` and its quality report. SQLite is generated state; extracted cases and original documents remain the evidence sources.
 
-When initialization or incremental update is the user's primary request, stop after successful compilation and report document counts, reused and re-extracted counts, failures, compiled case/scenario/service counts, and the state location. Do not require a design-review request in the same turn.
+When initialization or incremental update is the user's primary request, stop after successful compilation and report document counts, reused and re-extracted counts, failures, trusted/candidate/conflict/rejected case counts, compiled scenario/service counts, the human-review queue, and the state location. Do not require a design-review request in the same turn.
 
 ### 3. Build the current ChangeSpec
 
@@ -85,6 +90,13 @@ Write the generated specification to `.design-impact/current-change.json` for re
 Run `scripts/analyze_impact.py` internally against `.design-impact/history.db`. Inspect all compiled cases and retain every match reason. Never truncate results using similarity Top-K.
 
 Match independently on business object, capability, action, state, change type, invariant, rule, and historical service co-change. Use normalized aliases for terminology differences.
+
+Use knowledge tiers in every conclusion:
+
+- `trusted` evidence may support a high-confidence finding.
+- `candidate` evidence may suggest a scenario but requires confirmation.
+- `conflict` evidence must become an explicit design question with all sides shown.
+- `rejected` evidence must not influence design conclusions.
 
 ### 5. Expand expected scenarios
 
@@ -138,7 +150,7 @@ Lead with the useful result:
 5. Only the open questions that require a human decision.
 6. Traceable historical-document and CodeGraph evidence.
 
-Keep severity separate from confidence. Label general-rule-only findings `unverified`. Do not treat a completeness score as proof that the design is complete.
+Keep severity separate from confidence. Label general-rule-only findings `unverified`. Do not treat a completeness score, repeated wording, or document majority as proof that the design is complete.
 
 ## Recovery behavior
 

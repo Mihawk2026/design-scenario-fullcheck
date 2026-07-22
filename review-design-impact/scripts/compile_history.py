@@ -10,7 +10,7 @@ import os
 import sqlite3
 import sys
 import tempfile
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -27,6 +27,24 @@ TERM_FIELDS = {
     "changed_rules": "changed_rule",
 }
 
+VALIDATION_TO_TIER = {
+    "validated": "trusted",
+    "partial": "candidate",
+    "unverified": "candidate",
+    "conflict": "conflict",
+    "rejected": "rejected",
+}
+CONFIDENCE_VALUES = {"high", "medium", "low"}
+EVIDENCE_KINDS = {
+    "explicit",
+    "inferred",
+    "version-diff",
+    "review-comment",
+    "defect",
+    "incident",
+}
+EVIDENCE_LOCATION_KEYS = {"section", "page", "paragraph", "line", "location"}
+
 
 def normalized(value: str) -> str:
     return " ".join(value.strip().casefold().split())
@@ -39,6 +57,29 @@ def require_list(case: dict[str, Any], field: str) -> list[Any]:
     if not isinstance(value, list):
         raise ValueError(f"{field} must be a list")
     return value
+
+
+def evidence_errors(evidence: Any, field: str) -> list[str]:
+    errors: list[str] = []
+    if not isinstance(evidence, dict):
+        return [f"{field}.evidence must be an object"]
+    if evidence.get("kind") not in EVIDENCE_KINDS:
+        errors.append(f"{field}.evidence.kind is invalid or missing")
+    if not any(evidence.get(key) not in (None, "") for key in EVIDENCE_LOCATION_KEYS):
+        errors.append(f"{field}.evidence requires a stable source location")
+    return errors
+
+
+def knowledge_tier(case: dict[str, Any]) -> str:
+    validation = case.get("validation", {})
+    return VALIDATION_TO_TIER.get(validation.get("status"), "candidate")
+
+
+def item_tier(case_tier: str, evidence: Any) -> str:
+    if case_tier == "trusted" and isinstance(evidence, dict):
+        if evidence.get("kind") == "inferred":
+            return "candidate"
+    return case_tier
 
 
 def load_case_file(path: Path) -> list[dict[str, Any]]:
@@ -85,6 +126,20 @@ def validate_case(case: dict[str, Any], origin: Path) -> list[str]:
         errors.append("business_objects must not be empty")
     if not require_list(case, "change_types"):
         errors.append("change_types must not be empty")
+    validation = case.get("validation")
+    validation_status = None
+    if not isinstance(validation, dict):
+        errors.append("validation must be an object")
+    else:
+        validation_status = validation.get("status")
+        if validation_status not in VALIDATION_TO_TIER:
+            errors.append("validation.status is invalid or missing")
+        if validation.get("confidence") not in CONFIDENCE_VALUES:
+            errors.append("validation.confidence is invalid or missing")
+        if validation_status == "validated" and not validation.get("method"):
+            errors.append("validated cases require validation.method")
+        if validation_status == "validated" and require_list(case, "uncertain_fields"):
+            errors.append("validated cases cannot contain uncertain_fields; use partial")
     scenarios = case.get("scenarios", [])
     service_changes = case.get("service_changes", [])
     if not isinstance(scenarios, list):
@@ -92,8 +147,45 @@ def validate_case(case: dict[str, Any], origin: Path) -> list[str]:
     if not isinstance(service_changes, list):
         errors.append("service_changes must be a list")
     if isinstance(scenarios, list) and isinstance(service_changes, list):
-        if not scenarios and not service_changes:
+        if validation_status != "rejected" and not scenarios and not service_changes:
             errors.append("at least one scenario or service change is required")
+        for index, scenario in enumerate(scenarios):
+            if not isinstance(scenario, dict) or not scenario.get("name"):
+                errors.append(f"scenarios[{index}].name is required")
+            elif validation_status != "rejected":
+                errors.extend(evidence_errors(scenario.get("evidence"), f"scenarios[{index}]"))
+        for index, change in enumerate(service_changes):
+            if not isinstance(change, dict) or not change.get("service"):
+                errors.append(f"service_changes[{index}].service is required")
+            elif validation_status != "rejected":
+                errors.extend(evidence_errors(change.get("evidence"), f"service_changes[{index}]"))
+    for field in ("relations", "historical_omissions"):
+        for index, item in enumerate(require_list(case, field)):
+            if isinstance(item, dict) and validation_status != "rejected":
+                errors.extend(evidence_errors(item.get("evidence"), f"{field}[{index}]"))
+    unresolved_conflicts = 0
+    for index, conflict in enumerate(require_list(case, "conflicts")):
+        if not isinstance(conflict, dict) or not conflict.get("topic"):
+            errors.append(f"conflicts[{index}].topic is required")
+            continue
+        claims = conflict.get("claims", [])
+        if not isinstance(claims, list) or len(claims) < 2:
+            errors.append(f"conflicts[{index}].claims requires at least two claims")
+        else:
+            for claim_index, claim in enumerate(claims):
+                if not isinstance(claim, dict) or "value" not in claim:
+                    errors.append(f"conflicts[{index}].claims[{claim_index}].value is required")
+                else:
+                    errors.extend(
+                        evidence_errors(
+                            claim.get("evidence"),
+                            f"conflicts[{index}].claims[{claim_index}]",
+                        )
+                    )
+        if conflict.get("resolution_status") != "resolved":
+            unresolved_conflicts += 1
+    if unresolved_conflicts and validation_status not in {"conflict", "partial"}:
+        errors.append("unresolved conflicts require validation.status conflict or partial")
     return [f"{origin}: {case_id or '<unknown>'}: {error}" for error in errors]
 
 
@@ -141,6 +233,10 @@ CREATE TABLE cases (
     title TEXT NOT NULL,
     doc_path TEXT NOT NULL,
     domain TEXT,
+    validation_status TEXT NOT NULL,
+    confidence TEXT NOT NULL,
+    knowledge_tier TEXT NOT NULL,
+    validation_json TEXT NOT NULL,
     full_json TEXT NOT NULL
 );
 CREATE TABLE case_terms (
@@ -159,6 +255,7 @@ CREATE TABLE scenarios (
     precondition TEXT,
     trigger_text TEXT,
     expected_behavior TEXT,
+    knowledge_tier TEXT NOT NULL,
     evidence_json TEXT NOT NULL,
     FOREIGN KEY (case_id) REFERENCES cases(case_id) ON DELETE CASCADE
 );
@@ -170,6 +267,7 @@ CREATE TABLE service_changes (
     responsibility TEXT,
     asset_types_json TEXT NOT NULL,
     modification TEXT NOT NULL,
+    knowledge_tier TEXT NOT NULL,
     evidence_json TEXT NOT NULL,
     FOREIGN KEY (case_id) REFERENCES cases(case_id) ON DELETE CASCADE
 );
@@ -180,6 +278,7 @@ CREATE TABLE relations (
     source TEXT NOT NULL,
     relation_type TEXT NOT NULL,
     target TEXT NOT NULL,
+    knowledge_tier TEXT NOT NULL,
     evidence_json TEXT NOT NULL,
     FOREIGN KEY (case_id) REFERENCES cases(case_id) ON DELETE CASCADE
 );
@@ -189,6 +288,7 @@ CREATE TABLE historical_omissions (
     description TEXT NOT NULL,
     severity TEXT,
     source TEXT,
+    knowledge_tier TEXT NOT NULL,
     evidence_json TEXT NOT NULL,
     FOREIGN KEY (case_id) REFERENCES cases(case_id) ON DELETE CASCADE
 );
@@ -198,6 +298,14 @@ CREATE TABLE service_cochange (
     case_count INTEGER NOT NULL,
     case_ids_json TEXT NOT NULL,
     PRIMARY KEY (service_a, service_b)
+);
+CREATE TABLE conflicts (
+    conflict_id INTEGER PRIMARY KEY,
+    case_id TEXT NOT NULL,
+    topic TEXT NOT NULL,
+    resolution_status TEXT,
+    conflict_json TEXT NOT NULL,
+    FOREIGN KEY (case_id) REFERENCES cases(case_id) ON DELETE CASCADE
 );
 """
 
@@ -214,19 +322,31 @@ def insert_cases(connection: sqlite3.Connection, cases: Iterable[dict[str, Any]]
         case_id = case["case_id"].strip()
         source = case["source"]
         doc_path = source["path"]
+        case_tier = knowledge_tier(case)
+        validation = case["validation"]
         documents.setdefault(
             doc_path, (source.get("version"), case["title"], source)
         )
         connection.execute(
-            "INSERT INTO cases(case_id, title, doc_path, domain, full_json) VALUES(?,?,?,?,?)",
+            """INSERT INTO cases(
+                case_id, title, doc_path, domain, validation_status, confidence,
+                knowledge_tier, validation_json, full_json
+            ) VALUES(?,?,?,?,?,?,?,?,?)""",
             (
                 case_id,
                 case["title"],
                 doc_path,
                 case.get("domain"),
+                validation["status"],
+                validation["confidence"],
+                case_tier,
+                json_text(validation),
                 json_text(case),
             ),
         )
+
+        if case_tier == "rejected":
+            continue
 
         for field, term_type in TERM_FIELDS.items():
             for term in require_list(case, field):
@@ -241,14 +361,16 @@ def insert_cases(connection: sqlite3.Connection, cases: Iterable[dict[str, Any]]
                 continue
             connection.execute(
                 """INSERT INTO scenarios(
-                    case_id, name, precondition, trigger_text, expected_behavior, evidence_json
-                ) VALUES(?,?,?,?,?,?)""",
+                    case_id, name, precondition, trigger_text, expected_behavior,
+                    knowledge_tier, evidence_json
+                ) VALUES(?,?,?,?,?,?,?)""",
                 (
                     case_id,
                     scenario["name"],
                     scenario.get("precondition"),
                     scenario.get("trigger"),
                     scenario.get("expected_behavior"),
+                    item_tier(case_tier, scenario.get("evidence")),
                     json_text(scenario.get("evidence", {})),
                 ),
             )
@@ -269,8 +391,8 @@ def insert_cases(connection: sqlite3.Connection, cases: Iterable[dict[str, Any]]
                 connection.execute(
                     """INSERT INTO service_changes(
                         case_id, service, normalized_service, responsibility,
-                        asset_types_json, modification, evidence_json
-                    ) VALUES(?,?,?,?,?,?,?)""",
+                        asset_types_json, modification, knowledge_tier, evidence_json
+                    ) VALUES(?,?,?,?,?,?,?,?)""",
                     (
                         case_id,
                         service,
@@ -278,23 +400,28 @@ def insert_cases(connection: sqlite3.Connection, cases: Iterable[dict[str, Any]]
                         change.get("responsibility"),
                         json_text(change.get("asset_types", [])),
                         str(modification),
+                        item_tier(case_tier, change.get("evidence")),
                         json_text(change.get("evidence", {})),
                     ),
                 )
-        for service_a, service_b in itertools.combinations(sorted(services_in_case), 2):
-            service_cases[(service_a, service_b)].add(case_id)
+        if case_tier in {"trusted", "candidate"}:
+            for service_a, service_b in itertools.combinations(sorted(services_in_case), 2):
+                service_cases[(service_a, service_b)].add(case_id)
 
         for relation in require_list(case, "relations"):
             if not isinstance(relation, dict):
                 continue
             if all(relation.get(key) for key in ("source", "type", "target")):
                 connection.execute(
-                    "INSERT INTO relations(case_id, source, relation_type, target, evidence_json) VALUES(?,?,?,?,?)",
+                    """INSERT INTO relations(
+                        case_id, source, relation_type, target, knowledge_tier, evidence_json
+                    ) VALUES(?,?,?,?,?,?)""",
                     (
                         case_id,
                         relation["source"],
                         relation["type"],
                         relation["target"],
+                        item_tier(case_tier, relation.get("evidence")),
                         json_text(relation.get("evidence", {})),
                     ),
                 )
@@ -305,14 +432,29 @@ def insert_cases(connection: sqlite3.Connection, cases: Iterable[dict[str, Any]]
             if isinstance(omission, dict) and omission.get("description"):
                 connection.execute(
                     """INSERT INTO historical_omissions(
-                        case_id, description, severity, source, evidence_json
-                    ) VALUES(?,?,?,?,?)""",
+                        case_id, description, severity, source, knowledge_tier, evidence_json
+                    ) VALUES(?,?,?,?,?,?)""",
                     (
                         case_id,
                         omission["description"],
                         omission.get("severity"),
                         omission.get("source"),
+                        item_tier(case_tier, omission.get("evidence")),
                         json_text(omission.get("evidence", {})),
+                    ),
+                )
+
+        for conflict in require_list(case, "conflicts"):
+            if isinstance(conflict, dict) and conflict.get("topic"):
+                connection.execute(
+                    """INSERT INTO conflicts(
+                        case_id, topic, resolution_status, conflict_json
+                    ) VALUES(?,?,?,?)""",
+                    (
+                        case_id,
+                        conflict["topic"],
+                        conflict.get("resolution_status"),
+                        json_text(conflict),
                     ),
                 )
 
@@ -327,6 +469,45 @@ def insert_cases(connection: sqlite3.Connection, cases: Iterable[dict[str, Any]]
             "INSERT INTO service_cochange(service_a, service_b, case_count, case_ids_json) VALUES(?,?,?,?)",
             (service_a, service_b, len(case_ids), json_text(sorted(case_ids))),
         )
+
+
+def build_quality_report(cases: list[dict[str, Any]], database: Path) -> dict[str, Any]:
+    statuses = Counter(case["validation"]["status"] for case in cases)
+    tiers = Counter(knowledge_tier(case) for case in cases)
+    active_cases = [case for case in cases if knowledge_tier(case) != "rejected"]
+    service_names = {
+        str(change.get("service")).strip()
+        for case in active_cases
+        for change in require_list(case, "service_changes")
+        if isinstance(change, dict) and change.get("service")
+    }
+    review_queue = [
+        {
+            "case_id": case["case_id"],
+            "title": case["title"],
+            "validation_status": case["validation"]["status"],
+            "confidence": case["validation"]["confidence"],
+            "issues": case["validation"].get("issues", []),
+            "conflict_count": len(require_list(case, "conflicts")),
+        }
+        for case in cases
+        if knowledge_tier(case) in {"candidate", "conflict"}
+    ]
+    return {
+        "schema_version": 1,
+        "database": str(database),
+        "case_count": len(cases),
+        "validation_status_counts": dict(sorted(statuses.items())),
+        "knowledge_tier_counts": dict(sorted(tiers.items())),
+        "scenario_count": sum(
+            len(require_list(case, "scenarios")) for case in active_cases
+        ),
+        "service_count": len(service_names),
+        "conflict_count": sum(
+            len(require_list(case, "conflicts")) for case in active_cases
+        ),
+        "human_review_queue": review_queue,
+    }
 
 
 def main() -> int:
@@ -371,9 +552,22 @@ def main() -> int:
         if temp_path.exists():
             temp_path.unlink()
 
+    quality_report = build_quality_report(cases, output)
+    quality_path = output.with_name(f"{output.stem}.quality.json")
+    quality_path.write_text(
+        json.dumps(quality_report, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
     print(
         json.dumps(
-            {"cases": len(cases), "output": str(output)}, ensure_ascii=False
+            {
+                "cases": len(cases),
+                "knowledge_tiers": quality_report["knowledge_tier_counts"],
+                "human_review_queue": len(quality_report["human_review_queue"]),
+                "output": str(output),
+                "quality_report": str(quality_path),
+            },
+            ensure_ascii=False,
         )
     )
     return 0

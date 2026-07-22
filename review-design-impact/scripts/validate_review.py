@@ -20,6 +20,7 @@ ALLOWED_STATUSES = {
     "not-applicable",
 }
 HIGH_SEVERITY = {"critical", "high"}
+ALLOWED_KNOWLEDGE_TIERS = {"trusted", "candidate", "conflict", "heuristic"}
 
 
 def nonempty_list(value: Any) -> bool:
@@ -45,10 +46,12 @@ def main() -> int:
     warnings: list[str] = []
     required_top_level = {
         "change_spec",
+        "knowledge_quality",
         "scenario_coverage",
         "service_modifications",
         "cross_service_review",
         "findings",
+        "knowledge_conflicts",
         "open_questions",
         "evidence_trace",
     }
@@ -87,9 +90,16 @@ def main() -> int:
             errors.append(f"{prefix} has no responsible_services")
         if status == "not-applicable" and not scenario.get("not_applicable_reason"):
             errors.append(f"{prefix} requires not_applicable_reason")
+        tier = scenario.get("knowledge_tier")
+        if tier not in ALLOWED_KNOWLEDGE_TIERS:
+            errors.append(f"{prefix}.knowledge_tier is invalid or missing")
+        if tier != "trusted" and scenario.get("requires_confirmation") is not True:
+            errors.append(f"{prefix} is non-trusted and requires_confirmation must be true")
         if scenario.get("severity") in HIGH_SEVERITY and status in {"missing", "conflict"}:
             if not nonempty_list(scenario.get("evidence")):
                 errors.append(f"{prefix} is high risk but has no evidence")
+            if tier in {"candidate", "heuristic"} and scenario.get("confidence") == "high":
+                errors.append(f"{prefix} cannot be high confidence from {tier} knowledge alone")
         if status == "unverified" and nonempty_list(scenario.get("evidence")):
             warnings.append(f"{prefix} is unverified but includes evidence; confirm the status")
 
@@ -110,6 +120,11 @@ def main() -> int:
                 errors.append(f"{prefix}.{field} must be a list")
         if not nonempty_list(service.get("modifications")) and service.get("status") != "not-applicable":
             errors.append(f"{prefix} has no modifications and is not marked not-applicable")
+        service_tier = service.get("knowledge_tier")
+        if service_tier not in ALLOWED_KNOWLEDGE_TIERS:
+            errors.append(f"{prefix}.knowledge_tier is invalid or missing")
+        if service_tier != "trusted" and service.get("requires_confirmation") is not True:
+            errors.append(f"{prefix} is non-trusted and requires_confirmation must be true")
 
     cross_service = report.get("cross_service_review", {})
     if not isinstance(cross_service, dict):
@@ -135,6 +150,23 @@ def main() -> int:
         if finding.get("severity") in HIGH_SEVERITY and finding.get("status") in {"missing", "conflict"}:
             if not nonempty_list(finding.get("evidence")):
                 errors.append(f"{prefix} is high risk but has no evidence")
+
+    knowledge_quality = report.get("knowledge_quality")
+    if not isinstance(knowledge_quality, dict):
+        errors.append("knowledge_quality must be an object")
+
+    conflicts = report.get("knowledge_conflicts", [])
+    if not isinstance(conflicts, list):
+        errors.append("knowledge_conflicts must be a list")
+        conflicts = []
+    for index, conflict in enumerate(conflicts):
+        prefix = f"knowledge_conflicts[{index}]"
+        if not isinstance(conflict, dict) or not conflict.get("topic"):
+            errors.append(f"{prefix}.topic is required")
+            continue
+        claims = conflict.get("claims")
+        if not isinstance(claims, list) or len(claims) < 2:
+            errors.append(f"{prefix}.claims requires at least two claims")
 
     summary = report.get("summary")
     if isinstance(summary, dict):

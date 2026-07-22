@@ -101,8 +101,11 @@ def iter_case_objects(path: Path) -> Iterable[dict[str, Any]]:
                 yield item
 
 
-def extracted_sources(cases_dir: Path) -> tuple[dict[str, set[str]], list[str], int]:
+def extracted_sources(
+    cases_dir: Path,
+) -> tuple[dict[str, set[str]], dict[tuple[str, str], set[str]], list[str], int]:
     sources: dict[str, set[str]] = {}
+    validation_states: dict[tuple[str, str], set[str]] = {}
     errors: list[str] = []
     files = sorted(
         [*cases_dir.rglob("*.json"), *cases_dir.rglob("*.jsonl")],
@@ -115,12 +118,21 @@ def extracted_sources(cases_dir: Path) -> tuple[dict[str, set[str]], list[str], 
                 source_path = source.get("path")
                 source_hash = source.get("sha256")
                 if isinstance(source_path, str) and isinstance(source_hash, str):
-                    sources.setdefault(normalize_path(source_path), set()).add(
-                        source_hash.casefold()
+                    normalized_source = normalize_path(source_path)
+                    normalized_hash = source_hash.casefold()
+                    sources.setdefault(normalized_source, set()).add(normalized_hash)
+                    validation = case.get("validation", {})
+                    status = (
+                        validation.get("status")
+                        if isinstance(validation, dict)
+                        else "unverified"
                     )
+                    validation_states.setdefault(
+                        (normalized_source, normalized_hash), set()
+                    ).add(status or "unverified")
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             errors.append(f"{path}: {exc}")
-    return sources, errors, len(files)
+    return sources, validation_states, errors, len(files)
 
 
 def main() -> int:
@@ -239,12 +251,25 @@ def main() -> int:
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
-    extracted, case_errors, case_file_count = extracted_sources(cases_dir)
+    extracted, validation_states, case_errors, case_file_count = extracted_sources(
+        cases_dir
+    )
     pending = [
         document
         for document in selected
         if document["sha256"].casefold()
         not in extracted.get(normalize_path(document["path"]), set())
+    ]
+    pending_validation = [
+        document
+        for document in selected
+        if document["sha256"].casefold()
+        in extracted.get(normalize_path(document["path"]), set())
+        and "unverified"
+        in validation_states.get(
+            (normalize_path(document["path"]), document["sha256"].casefold()),
+            {"unverified"},
+        )
     ]
     database = state_dir / "history.db"
     case_files = [*cases_dir.rglob("*.json"), *cases_dir.rglob("*.jsonl")]
@@ -265,6 +290,7 @@ def main() -> int:
         "document_count": len(selected),
         "case_file_count": case_file_count,
         "pending_extraction": pending,
+        "pending_validation": pending_validation,
         "removed_documents": removed,
         "needs_compile": needs_compile,
         "history_db": str(database),
@@ -272,8 +298,17 @@ def main() -> int:
         "errors": [*errors, *case_errors],
         "next_actions": [
             *( ["extract_pending_documents"] if pending else [] ),
-            *( ["compile_history"] if needs_compile and not pending else [] ),
-            *( ["analyze_current_change"] if not pending else [] ),
+            *( ["verify_pending_cases"] if pending_validation else [] ),
+            *(
+                ["compile_history"]
+                if needs_compile and not pending and not pending_validation
+                else []
+            ),
+            *(
+                ["analyze_current_change"]
+                if not pending and not pending_validation
+                else []
+            ),
         ],
     }
     session_path = state_dir / "session.json"
@@ -288,6 +323,7 @@ def main() -> int:
                 "discovery_mode": discovery_mode,
                 "documents": len(selected),
                 "pending_extraction": len(pending),
+                "pending_validation": len(pending_validation),
                 "case_files": case_file_count,
                 "needs_compile": needs_compile,
                 "errors": len(session["errors"]),

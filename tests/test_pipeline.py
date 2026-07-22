@@ -75,7 +75,7 @@ class PipelineTest(unittest.TestCase):
                     {
                         "name": "冻结与支付并发",
                         "expected_behavior": "只能一个操作成功",
-                        "evidence": {"kind": "explicit"},
+                        "evidence": {"kind": "explicit", "section": "异常场景"},
                     }
                 ],
                 "service_changes": [
@@ -84,21 +84,76 @@ class PipelineTest(unittest.TestCase):
                         "responsibility": "订单状态真相源",
                         "asset_types": ["domain-logic"],
                         "modifications": ["增加冻结状态"],
-                        "evidence": {"kind": "explicit"},
+                        "evidence": {"kind": "explicit", "section": "服务改造"},
                     },
                     {
                         "service": "payment-service",
                         "responsibility": "支付许可校验",
                         "asset_types": ["domain-logic"],
                         "modifications": ["拒绝冻结订单支付"],
-                        "evidence": {"kind": "explicit"},
+                        "evidence": {"kind": "explicit", "section": "服务改造"},
                     },
                 ],
                 "relations": [],
                 "historical_omissions": [],
+                "conflicts": [],
+                "uncertain_fields": [],
+                "validation": {
+                    "status": "validated",
+                    "confidence": "high",
+                    "method": "independent-source-reread",
+                    "issues": [],
+                },
             }
             (cases / "order-freeze-v1.json").write_text(
                 json.dumps(change_case, ensure_ascii=False), encoding="utf-8"
+            )
+            conflict_case = {
+                **change_case,
+                "case_id": "order-freeze-cancel-conflict",
+                "title": "冻结期间取消规则冲突",
+                "change_types": ["修改业务规则"],
+                "scenarios": [
+                    {
+                        "name": "冻结期间取消",
+                        "expected_behavior": "需要区分冻结类型",
+                        "evidence": {"kind": "explicit", "section": "取消规则"},
+                    }
+                ],
+                "service_changes": [
+                    {
+                        "service": "customer-admin",
+                        "responsibility": "客服取消入口",
+                        "asset_types": ["admin-ui"],
+                        "modifications": ["按冻结类型限制取消"],
+                        "evidence": {"kind": "explicit", "section": "客服操作"},
+                    }
+                ],
+                "conflicts": [
+                    {
+                        "topic": "冻结期间是否允许取消",
+                        "claims": [
+                            {
+                                "value": "允许",
+                                "evidence": {"kind": "explicit", "section": "人工冻结"},
+                            },
+                            {
+                                "value": "禁止",
+                                "evidence": {"kind": "explicit", "section": "风控冻结"},
+                            },
+                        ],
+                        "resolution_status": "unresolved",
+                    }
+                ],
+                "validation": {
+                    "status": "conflict",
+                    "confidence": "high",
+                    "method": "independent-source-reread",
+                    "issues": ["冻结类型适用范围不同"],
+                },
+            }
+            (cases / "order-freeze-conflict.json").write_text(
+                json.dumps(conflict_case, ensure_ascii=False), encoding="utf-8"
             )
 
             refreshed_state = run_script(
@@ -109,6 +164,7 @@ class PipelineTest(unittest.TestCase):
             self.assertEqual(refreshed_state.returncode, 0, refreshed_state.stderr)
             session = json.loads((state / "session.json").read_text(encoding="utf-8"))
             self.assertEqual(session["pending_extraction"], [])
+            self.assertEqual(session["pending_validation"], [])
 
             database = root / "history.db"
             compile_result = run_script(
@@ -119,6 +175,12 @@ class PipelineTest(unittest.TestCase):
                 str(database),
             )
             self.assertEqual(compile_result.returncode, 0, compile_result.stderr)
+            quality = json.loads(
+                (root / "history.quality.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(quality["knowledge_tier_counts"]["trusted"], 1)
+            self.assertEqual(quality["knowledge_tier_counts"]["conflict"], 1)
+            self.assertEqual(len(quality["human_review_queue"]), 1)
 
             spec = {
                 "title": "订单增加冻结能力",
@@ -148,10 +210,17 @@ class PipelineTest(unittest.TestCase):
             )
             self.assertEqual(impact_result.returncode, 0, impact_result.stderr)
             impact = json.loads(impact_path.read_text(encoding="utf-8"))
-            self.assertEqual(impact["scan"]["total_cases"], 1)
-            self.assertEqual(impact["scan"]["matched_cases"], 1)
-            self.assertEqual(len(impact["historical_scenarios"]), 1)
-            self.assertEqual(len(impact["candidate_services"]), 2)
+            self.assertEqual(impact["scan"]["total_cases"], 2)
+            self.assertEqual(impact["scan"]["matched_cases"], 2)
+            self.assertEqual(len(impact["historical_scenarios"]), 2)
+            self.assertEqual(len(impact["candidate_services"]), 3)
+            self.assertEqual(len(impact["historical_conflicts"]), 1)
+            trusted_scenario = next(
+                item
+                for item in impact["historical_scenarios"]
+                if item["scenario"] == "冻结与支付并发"
+            )
+            self.assertEqual(trusted_scenario["knowledge_tier"], "trusted")
 
             review = {
                 "change_spec": spec,
@@ -164,6 +233,13 @@ class PipelineTest(unittest.TestCase):
                     "unverified": 0,
                     "not_applicable": 0,
                 },
+                "knowledge_quality": {
+                    "trusted_cases": 1,
+                    "candidate_cases": 0,
+                    "conflict_cases": 1,
+                    "rejected_cases": 0,
+                    "human_review_queue": 1,
+                },
                 "scenario_coverage": [
                     {
                         "scenario": "冻结与支付并发",
@@ -171,6 +247,8 @@ class PipelineTest(unittest.TestCase):
                         "responsible_services": ["order-service", "payment-service"],
                         "severity": "high",
                         "confidence": "high",
+                        "knowledge_tier": "trusted",
+                        "requires_confirmation": False,
                         "evidence": [{"type": "historical", "case_id": "order-freeze-v1"}],
                     }
                 ],
@@ -179,6 +257,8 @@ class PipelineTest(unittest.TestCase):
                         "service": "order-service",
                         "reason": "状态真相源",
                         "status": "confirmed",
+                        "knowledge_tier": "trusted",
+                        "requires_confirmation": False,
                         "modifications": ["增加冻结状态"],
                         "tests": ["状态迁移"],
                         "evidence": [{"type": "historical"}],
@@ -187,6 +267,8 @@ class PipelineTest(unittest.TestCase):
                         "service": "payment-service",
                         "reason": "支付许可校验",
                         "status": "confirmed",
+                        "knowledge_tier": "trusted",
+                        "requires_confirmation": False,
                         "modifications": ["拒绝冻结订单支付"],
                         "tests": ["冻结后支付"],
                         "evidence": [{"type": "historical"}],
@@ -200,6 +282,16 @@ class PipelineTest(unittest.TestCase):
                     "open_items": [],
                 },
                 "findings": [],
+                "knowledge_conflicts": [
+                    {
+                        "topic": "冻结期间是否允许取消",
+                        "claims": [
+                            {"value": "允许", "source": "人工冻结"},
+                            {"value": "禁止", "source": "风控冻结"},
+                        ],
+                        "resolution_status": "unresolved",
+                    }
+                ],
                 "open_questions": [],
                 "evidence_trace": [],
             }

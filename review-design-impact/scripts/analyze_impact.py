@@ -76,6 +76,17 @@ def evidence_case_id(case_id: str) -> dict[str, str]:
     return {"type": "historical", "case_id": case_id}
 
 
+def aggregate_tier(tiers: list[str]) -> str:
+    values = set(tiers)
+    if "conflict" in values:
+        return "conflict"
+    if "trusted" in values:
+        return "trusted"
+    if "candidate" in values:
+        return "candidate"
+    return "rejected"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Full-scan a compiled local design history database."
@@ -108,12 +119,16 @@ def main() -> int:
     connection.row_factory = sqlite3.Row
     try:
         rows = connection.execute(
-            "SELECT case_id, title, doc_path, domain, full_json FROM cases ORDER BY case_id"
+            """SELECT case_id, title, doc_path, domain, validation_status,
+                      confidence, knowledge_tier, full_json
+               FROM cases ORDER BY case_id"""
         ).fetchall()
         matched_cases: list[dict[str, Any]] = []
         matched_case_ids: set[str] = set()
 
         for row in rows:
+            if row["knowledge_tier"] == "rejected":
+                continue
             case = json.loads(row["full_json"])
             reasons: list[dict[str, Any]] = []
             for spec_field, case_field in SPEC_TO_CASE_FIELDS.items():
@@ -135,6 +150,9 @@ def main() -> int:
                         "title": row["title"],
                         "source": row["doc_path"],
                         "domain": row["domain"],
+                        "validation_status": row["validation_status"],
+                        "confidence": row["confidence"],
+                        "knowledge_tier": row["knowledge_tier"],
                         "match_reasons": reasons,
                     }
                 )
@@ -142,13 +160,14 @@ def main() -> int:
         scenarios: dict[str, dict[str, Any]] = {}
         services: dict[str, dict[str, Any]] = {}
         omissions: list[dict[str, Any]] = []
+        conflicts: list[dict[str, Any]] = []
 
         if matched_case_ids:
             placeholders = ",".join("?" for _ in matched_case_ids)
             case_id_args = sorted(matched_case_ids)
             scenario_rows = connection.execute(
                 f"""SELECT case_id, name, precondition, trigger_text,
-                           expected_behavior, evidence_json
+                           expected_behavior, knowledge_tier, evidence_json
                     FROM scenarios WHERE case_id IN ({placeholders})
                     ORDER BY name, case_id""",
                 case_id_args,
@@ -163,6 +182,7 @@ def main() -> int:
                         "triggers": [],
                         "expected_behaviors": [],
                         "case_ids": [],
+                        "knowledge_tiers": [],
                         "evidence": [],
                     },
                 )
@@ -175,16 +195,19 @@ def main() -> int:
                         item[target].append(value)
                 if row["case_id"] not in item["case_ids"]:
                     item["case_ids"].append(row["case_id"])
+                if row["knowledge_tier"] not in item["knowledge_tiers"]:
+                    item["knowledge_tiers"].append(row["knowledge_tier"])
                 item["evidence"].append(
                     {
                         **evidence_case_id(row["case_id"]),
+                        "knowledge_tier": row["knowledge_tier"],
                         "detail": json.loads(row["evidence_json"]),
                     }
                 )
 
             service_rows = connection.execute(
                 f"""SELECT case_id, service, normalized_service, responsibility,
-                           asset_types_json, modification, evidence_json
+                           asset_types_json, modification, knowledge_tier, evidence_json
                     FROM service_changes WHERE case_id IN ({placeholders})
                     ORDER BY normalized_service, case_id, service_change_id""",
                 case_id_args,
@@ -199,6 +222,7 @@ def main() -> int:
                         "asset_types": [],
                         "modifications": [],
                         "case_ids": [],
+                        "knowledge_tiers": [],
                         "evidence": [],
                         "source": "matched-history",
                     },
@@ -214,15 +238,19 @@ def main() -> int:
                     item["modifications"].append(modification)
                 if row["case_id"] not in item["case_ids"]:
                     item["case_ids"].append(row["case_id"])
+                if row["knowledge_tier"] not in item["knowledge_tiers"]:
+                    item["knowledge_tiers"].append(row["knowledge_tier"])
                 item["evidence"].append(
                     {
                         **evidence_case_id(row["case_id"]),
+                        "knowledge_tier": row["knowledge_tier"],
                         "detail": json.loads(row["evidence_json"]),
                     }
                 )
 
             omission_rows = connection.execute(
-                f"""SELECT case_id, description, severity, source, evidence_json
+                f"""SELECT case_id, description, severity, source,
+                           knowledge_tier, evidence_json
                     FROM historical_omissions WHERE case_id IN ({placeholders})
                     ORDER BY case_id, omission_id""",
                 case_id_args,
@@ -234,9 +262,33 @@ def main() -> int:
                         "description": row["description"],
                         "severity": row["severity"],
                         "source": row["source"],
+                        "knowledge_tier": row["knowledge_tier"],
                         "evidence": json.loads(row["evidence_json"]),
                     }
                 )
+
+            conflict_rows = connection.execute(
+                f"""SELECT case_id, topic, resolution_status, conflict_json
+                    FROM conflicts WHERE case_id IN ({placeholders})
+                    ORDER BY case_id, conflict_id""",
+                case_id_args,
+            ).fetchall()
+            for row in conflict_rows:
+                conflicts.append(
+                    {
+                        "case_id": row["case_id"],
+                        "topic": row["topic"],
+                        "resolution_status": row["resolution_status"],
+                        "detail": json.loads(row["conflict_json"]),
+                    }
+                )
+
+        for item in scenarios.values():
+            item["knowledge_tier"] = aggregate_tier(item["knowledge_tiers"])
+            item["requires_confirmation"] = item["knowledge_tier"] != "trusted"
+        for item in services.values():
+            item["knowledge_tier"] = aggregate_tier(item["knowledge_tiers"])
+            item["requires_confirmation"] = item["knowledge_tier"] != "trusted"
 
         direct_services = set(services)
         cochange_rows = connection.execute(
@@ -264,6 +316,9 @@ def main() -> int:
                         "asset_types": [],
                         "modifications": [],
                         "case_ids": json.loads(row["case_ids_json"]),
+                        "knowledge_tiers": ["candidate"],
+                        "knowledge_tier": "candidate",
+                        "requires_confirmation": True,
                         "evidence": [
                             {
                                 "type": "historical-cochange",
@@ -284,14 +339,20 @@ def main() -> int:
         if not spec.get("change_types"):
             issues.append("ChangeSpec has no change_types")
 
+        tier_counts: dict[str, int] = defaultdict(int)
+        for row in rows:
+            tier_counts[row["knowledge_tier"]] += 1
+
         result = {
-            "schema_version": 1,
+            "schema_version": 2,
             "change_spec": spec,
             "scan": {
                 "mode": "full-corpus",
                 "uses_embeddings": False,
                 "uses_top_k": False,
                 "total_cases": len(rows),
+                "knowledge_tier_counts": dict(sorted(tier_counts.items())),
+                "rejected_cases_excluded": tier_counts.get("rejected", 0),
                 "matched_cases": len(matched_cases),
             },
             "matched_cases": matched_cases,
@@ -303,6 +364,7 @@ def main() -> int:
             ),
             "service_cochanges": cochanges,
             "historical_omissions": omissions,
+            "historical_conflicts": conflicts,
             "change_spec_issues": issues,
         }
     finally:
