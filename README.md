@@ -48,6 +48,8 @@ review-design-impact/
 使用 $review-design-impact，把 D:\company-designs 中的全部历史设计初始化为设计场景知识库。
 ```
 
+这里使用的代码图实现明确是 [`colbymchenry/codegraph`](https://github.com/colbymchenry/codegraph)。只要它已经作为 MCP 连接到当前 AI 客户端，并且相关代码仓已经执行过一次 `codegraph init`，后续采集步骤都由 SKILL通过自然语言工作流自动完成。
+
 SKILL会自动完成：
 
 1. 扫描 Markdown、文本、HTML、JSON、YAML、Word 和 PDF 设计文档。
@@ -57,9 +59,10 @@ SKILL会自动完成：
 5. 建立业务关联和历史共同变更关系。
 6. 保存原文路径、版本、章节或页码作为证据。
 7. 构建本地历史设计知识。
-8. 如果当前环境可访问 CodeGraph，按代码仓、分支和提交号导出接口、消息、表、任务、入口及依赖关系。
-9. 把 CodeGraph 结果编译成本地代码事实快照，并记录覆盖范围和未覆盖范围。
-10. 校验历史知识和代码事实快照。
+8. 如果当前环境已经连接开源 CodeGraph MCP，自动发现它实际暴露的 MCP tools。
+9. 根据历史设计中的服务、接口、事件、表、任务、状态和代码符号线索，通过 MCP 查询每个已建立索引的代码仓。
+10. 保存 MCP 调用参数、原始响应、响应哈希、stale banner、仓库分支和提交号，并编译成本地代码事实快照。
+11. 校验历史知识和代码事实快照。
 
 初始化完成后，应返回类似结果：
 
@@ -75,7 +78,9 @@ SKILL会自动完成：
 业务场景：2,136个
 涉及微服务：67个
 需要人工复核：107项
+CodeGraph MCP：codegraph_explore，调用126次
 代码事实快照：18个代码仓，固定到对应分支和提交号
+MCP异常响应：stale 1次，truncated 2次
 代码覆盖缺口：数据仓库、外部调度平台
 无法解析文档：5份
 ```
@@ -111,7 +116,7 @@ SKILL会自动比较文件哈希：
 - 没有变化的文件：直接复用，不重复分析。
 - 删除的文件：移除对应的历史案例。
 - 移动或重命名的文件：根据内容哈希和版本关系处理。
-- 代码仓分支、提交或 CodeGraph 索引发生变化：只在这个更新阶段重新导出变化部分，并重建代码事实快照。
+- 代码仓分支、提交、历史查询线索或 CodeGraph MCP 索引发生变化：只在这个更新阶段重新查询变化部分，并重建代码事实快照。
 
 新增或修改的文档会重新执行“文档级抽取 → 独立原文复核 → 质量分层”，不会未经验证直接加入可信知识。
 
@@ -142,8 +147,11 @@ SKILL默认在当前工作区维护：
 .design-impact/
 ├─ manifest.json
 ├─ session.json
+├─ repository-map.json
 ├─ cases/
 ├─ history.db
+├─ codegraph-mcp/
+│  └─ raw/
 ├─ code-facts.db
 ├─ code-manifest.json
 ├─ code-coverage.json
@@ -327,23 +335,31 @@ SKILL：先检查本地状态是否最新，再读取当前设计，使用全部
 
 ## CodeGraph说明
 
-CodeGraph是可选能力，而且只允许在两个阶段使用：
+本 SKILL 明确适配 [colbymchenry/codegraph](https://github.com/colbymchenry/codegraph) 的 MCP Server，不把它当成可以任意导出全库 JSON 的 API，也不会直接读取 `.codegraph/codegraph.db`。MCP宿主可能给工具名增加命名空间，SKILL会按实际工具描述识别。
 
-1. **全量初始化**：为范围内的全部代码仓生成代码事实快照。
-2. **增量更新**：根据代码仓分支、提交号和索引变化更新快照。
+CodeGraph MCP是可选能力，而且只允许在两个阶段调用：
 
-进入需求分析、设计生成、设计检查和微服务拆分阶段后，SKILL只读取 `.design-impact/code-facts.db`，不会实时查询 CodeGraph，也不会用临时代码搜索替代快照。
+1. **全量初始化**：先从历史设计中形成技术查询线索，再对每个已建立 CodeGraph 索引的代码仓调用 MCP，生成代码事实快照。
+2. **增量更新**：根据代码仓分支、提交号、历史线索和 MCP 响应的新鲜度，只重新查询发生变化的部分。
+
+该开源 MCP 默认只需要 `codegraph_explore`。SKILL不会要求额外开启 `status/search/node/callers/callees/impact/files`；这些工具只有在 MCP 已经暴露时才会使用。`codegraph_explore` 的源码片段、调用路径和 blast radius 会被归一化为本地事实，并保留对应的 MCP 调用证据。
+
+CodeGraph MCP是按问题查询的，不是全库导出接口。因此 SKILL会记录每条查询线索的 `matched`、`not-found`、`ambiguous`、`truncated` 或 `not-queried` 状态，不会因为所有调用成功就宣称“代码已100%覆盖”。
+
+进入需求分析、设计生成、设计检查和微服务拆分阶段后，SKILL只读取 `.design-impact/code-facts.db`，不会调用 CodeGraph MCP、CodeGraph CLI、直接读取 `.codegraph` 数据库，也不会用临时代码搜索替代快照。
 
 执行顺序固定为：
 
 ```text
-全量初始化或增量更新：历史文档 + CodeGraph → 本地历史知识 + 离线代码事实快照
+全量初始化或增量更新：历史文档 → 技术查询线索 → CodeGraph MCP调用账本 → 离线代码事实快照
 设计检查：本地历史知识 + 离线代码事实快照 → 场景检查与微服务拆分
 ```
 
 这样可以保证同一份快照上的检查结果可复现，也避免代码结构覆盖业务关联。代码事实只能用于确认候选或补充技术修改点；不会因为快照中找不到调用关系，就删除历史业务关联发现的候选服务。
 
-如果快照过期且 CodeGraph 可用，SKILL会先完成增量更新再继续检查。如果无法访问本地代码仓以核对提交号，会标记快照新鲜度为“未知”，但不会反复刷新。如果 CodeGraph 不可用，仍会完成业务场景检查，并明确标记代码证据为“不可用”“已过期”或“新鲜度未知”，不会把它包装成已验证结论。
+CodeGraph MCP会自行同步索引，SKILL会读取 MCP 响应中的 pending-sync 或 stale banner；带有这些标记的结果不能成为高置信证据。如果快照过期且 MCP 可用，SKILL会先完成增量更新再继续检查。如果 MCP没有暴露工具，通常意味着项目没有索引或服务未激活，SKILL不会擅自执行 `codegraph init`，而是继续业务检查并把代码证据标记为不可用。
+
+如果无法访问本地代码仓以核对提交号，会标记快照新鲜度为“未知”，但不会反复刷新。任何情况下，都不会因为 MCP 找不到调用关系而删除历史业务关联发现的候选服务。
 
 ## 常见问题
 

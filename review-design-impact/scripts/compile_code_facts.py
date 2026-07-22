@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Compile a CodeGraph business-impact export into an offline code fact snapshot."""
+"""Compile normalized colbymchenry/codegraph MCP observations into a snapshot."""
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sqlite3
@@ -15,6 +16,32 @@ from typing import Any
 
 SCHEMA = """
 PRAGMA foreign_keys = ON;
+CREATE TABLE mcp_metadata (
+    key TEXT PRIMARY KEY,
+    value_json TEXT NOT NULL
+);
+CREATE TABLE mcp_calls (
+    call_id TEXT PRIMARY KEY,
+    repository TEXT NOT NULL,
+    tool TEXT NOT NULL,
+    arguments_json TEXT NOT NULL,
+    response_path TEXT NOT NULL,
+    response_sha256 TEXT NOT NULL,
+    observed_at TEXT NOT NULL,
+    status TEXT NOT NULL,
+    staleness TEXT NOT NULL
+);
+CREATE INDEX idx_mcp_calls_repository ON mcp_calls(repository, status, staleness);
+CREATE TABLE query_seeds (
+    seed_id INTEGER PRIMARY KEY,
+    repository TEXT NOT NULL,
+    category TEXT NOT NULL,
+    seed TEXT NOT NULL,
+    status TEXT NOT NULL,
+    mcp_call_ids_json TEXT NOT NULL,
+    notes TEXT
+);
+CREATE INDEX idx_query_seeds_repository ON query_seeds(repository, category, status);
 CREATE TABLE repositories (
     name TEXT PRIMARY KEY,
     path TEXT,
@@ -64,6 +91,14 @@ def json_text(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
 
 
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def require_list(payload: dict[str, Any], field: str) -> list[Any]:
     value = payload.get(field, [])
     if not isinstance(value, list):
@@ -71,15 +106,45 @@ def require_list(payload: dict[str, Any], field: str) -> list[Any]:
     return value
 
 
-def validate(payload: dict[str, Any]) -> list[str]:
+def validate_mcp_evidence(
+    value: Any, location: str, call_ids: set[str], errors: list[str]
+) -> None:
+    if not isinstance(value, dict):
+        errors.append(f"{location}.evidence must be an object")
+        return
+    if value.get("kind") != "codegraph-mcp":
+        errors.append(f"{location}.evidence.kind must be codegraph-mcp")
+    call_id = value.get("mcp_call_id")
+    if call_id not in call_ids:
+        errors.append(f"{location}.evidence.mcp_call_id is not declared: {call_id}")
+
+
+def validate(payload: dict[str, Any], capture_root: Path) -> list[str]:
     errors: list[str] = []
+    schema_version = payload.get("schema_version")
+    if schema_version != 2:
+        errors.append("schema_version must be 2")
     try:
         repositories = require_list(payload, "repositories")
+        mcp_calls = require_list(payload, "mcp_calls")
+        query_seeds = require_list(payload, "query_seeds")
         entities = require_list(payload, "entities")
         relations = require_list(payload, "relations")
         mappings = require_list(payload, "business_mappings")
     except ValueError as exc:
         return [str(exc)]
+
+    mcp = payload.get("mcp", {})
+    if not isinstance(mcp, dict):
+        errors.append("mcp must be an object")
+    else:
+        for field in ("server", "implementation", "transport"):
+            if not mcp.get(field):
+                errors.append(f"mcp.{field} is required")
+        if mcp.get("transport") != "mcp":
+            errors.append("mcp.transport must be mcp")
+        if not isinstance(mcp.get("tools_observed"), list):
+            errors.append("mcp.tools_observed must be a list")
 
     repository_names: set[str] = set()
     for index, repository in enumerate(repositories):
@@ -97,6 +162,105 @@ def validate(payload: dict[str, Any]) -> list[str]:
             if not isinstance(repository.get(field, []), list):
                 errors.append(f"repositories[{index}].{field} must be a list")
 
+    call_ids: set[str] = set()
+    call_quality: dict[str, tuple[str | None, str | None]] = {}
+    for index, call in enumerate(mcp_calls):
+        if not isinstance(call, dict):
+            errors.append(f"mcp_calls[{index}] must be an object")
+            continue
+        for field in (
+            "id",
+            "repository",
+            "tool",
+            "response_path",
+            "response_sha256",
+            "observed_at",
+        ):
+            if not call.get(field):
+                errors.append(f"mcp_calls[{index}].{field} is required")
+        call_id = call.get("id")
+        if call_id in call_ids:
+            errors.append(f"duplicate MCP call id: {call_id}")
+        if call_id:
+            call_ids.add(call_id)
+            call_quality[call_id] = (call.get("status"), call.get("staleness"))
+        if call.get("repository") not in repository_names:
+            errors.append(
+                f"mcp_calls[{index}].repository is not declared: "
+                f"{call.get('repository')}"
+            )
+        if not isinstance(call.get("arguments"), dict):
+            errors.append(f"mcp_calls[{index}].arguments must be an object")
+        digest = call.get("response_sha256")
+        if isinstance(digest, str) and (
+            len(digest) != 64
+            or any(
+                character not in "0123456789abcdefABCDEF" for character in digest
+            )
+        ):
+            errors.append(f"mcp_calls[{index}].response_sha256 must be 64 hex characters")
+        response_value = call.get("response_path")
+        if isinstance(response_value, str) and response_value:
+            response_path = (capture_root / response_value).resolve()
+            try:
+                response_path.relative_to(capture_root.resolve())
+            except ValueError:
+                errors.append(
+                    f"mcp_calls[{index}].response_path must stay inside the capture directory"
+                )
+            else:
+                if not response_path.is_file():
+                    errors.append(
+                        f"mcp_calls[{index}].response_path does not exist: {response_value}"
+                    )
+                elif isinstance(digest, str) and len(digest) == 64:
+                    if file_sha256(response_path) != digest.casefold():
+                        errors.append(
+                            f"mcp_calls[{index}].response_sha256 does not match the raw response"
+                        )
+        if call.get("status") not in {"ok", "error", "truncated"}:
+            errors.append(f"mcp_calls[{index}].status is invalid or missing")
+        if call.get("staleness") not in {"fresh", "stale", "unknown"}:
+            errors.append(f"mcp_calls[{index}].staleness is invalid or missing")
+
+    if not mcp_calls:
+        errors.append("mcp_calls must contain at least one observed MCP call")
+
+    for index, query_seed in enumerate(query_seeds):
+        if not isinstance(query_seed, dict):
+            errors.append(f"query_seeds[{index}] must be an object")
+            continue
+        for field in ("repository", "category", "seed"):
+            if not query_seed.get(field):
+                errors.append(f"query_seeds[{index}].{field} is required")
+        if query_seed.get("repository") not in repository_names:
+            errors.append(
+                f"query_seeds[{index}].repository is not declared: "
+                f"{query_seed.get('repository')}"
+            )
+        if query_seed.get("status") not in {
+            "matched",
+            "not-found",
+            "ambiguous",
+            "truncated",
+            "not-queried",
+        }:
+            errors.append(f"query_seeds[{index}].status is invalid or missing")
+        seed_call_ids = query_seed.get("mcp_call_ids")
+        if not isinstance(seed_call_ids, list):
+            errors.append(f"query_seeds[{index}].mcp_call_ids must be a list")
+        else:
+            for call_id in seed_call_ids:
+                if call_id not in call_ids:
+                    errors.append(
+                        f"query_seeds[{index}].mcp_call_ids contains undeclared id: "
+                        f"{call_id}"
+                    )
+            if query_seed.get("status") != "not-queried" and not seed_call_ids:
+                errors.append(
+                    f"query_seeds[{index}].mcp_call_ids is required for queried status"
+                )
+
     entity_ids: set[str] = set()
     for index, entity in enumerate(entities):
         if not isinstance(entity, dict):
@@ -113,6 +277,9 @@ def validate(payload: dict[str, Any]) -> list[str]:
             errors.append(
                 f"entities[{index}].repository is not declared: {entity.get('repository')}"
             )
+        validate_mcp_evidence(
+            entity.get("evidence"), f"entities[{index}]", call_ids, errors
+        )
 
     for index, relation in enumerate(relations):
         if not isinstance(relation, dict):
@@ -124,6 +291,9 @@ def validate(payload: dict[str, Any]) -> list[str]:
         repository = relation.get("repository")
         if repository and repository not in repository_names:
             errors.append(f"relations[{index}].repository is not declared: {repository}")
+        validate_mcp_evidence(
+            relation.get("evidence"), f"relations[{index}]", call_ids, errors
+        )
 
     for index, mapping in enumerate(mappings):
         if not isinstance(mapping, dict):
@@ -137,10 +307,64 @@ def validate(payload: dict[str, Any]) -> list[str]:
             )
         if mapping.get("confidence") not in {"high", "medium", "low"}:
             errors.append(f"business_mappings[{index}].confidence is invalid or missing")
+        validate_mcp_evidence(
+            mapping.get("evidence"),
+            f"business_mappings[{index}]",
+            call_ids,
+            errors,
+        )
+        evidence = mapping.get("evidence", {})
+        call_id = evidence.get("mcp_call_id") if isinstance(evidence, dict) else None
+        if (
+            mapping.get("confidence") == "high"
+            and call_quality.get(call_id) != ("ok", "fresh")
+        ):
+            errors.append(
+                f"business_mappings[{index}] cannot be high confidence without "
+                "a fresh successful MCP call"
+            )
     return errors
 
 
 def insert_payload(connection: sqlite3.Connection, payload: dict[str, Any]) -> None:
+    mcp = payload["mcp"]
+    for key, value in mcp.items():
+        connection.execute(
+            "INSERT INTO mcp_metadata(key, value_json) VALUES(?,?)",
+            (key, json_text(value)),
+        )
+    for call in payload.get("mcp_calls", []):
+        connection.execute(
+            """INSERT INTO mcp_calls(
+                call_id, repository, tool, arguments_json, response_path,
+                response_sha256, observed_at, status, staleness
+            ) VALUES(?,?,?,?,?,?,?,?,?)""",
+            (
+                call["id"],
+                call["repository"],
+                call["tool"],
+                json_text(call["arguments"]),
+                call["response_path"],
+                call["response_sha256"],
+                call["observed_at"],
+                call["status"],
+                call["staleness"],
+            ),
+        )
+    for query_seed in payload.get("query_seeds", []):
+        connection.execute(
+            """INSERT INTO query_seeds(
+                repository, category, seed, status, mcp_call_ids_json, notes
+            ) VALUES(?,?,?,?,?,?)""",
+            (
+                query_seed["repository"],
+                query_seed["category"],
+                query_seed["seed"],
+                query_seed["status"],
+                json_text(query_seed.get("mcp_call_ids", [])),
+                query_seed.get("notes"),
+            ),
+        )
     for repository in payload["repositories"]:
         connection.execute(
             """INSERT INTO repositories(
@@ -202,9 +426,9 @@ def insert_payload(connection: sqlite3.Connection, payload: dict[str, Any]) -> N
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Compile a CodeGraph export into an offline code fact snapshot."
+        description="Compile normalized CodeGraph MCP observations into a snapshot."
     )
-    parser.add_argument("--input", required=True, help="CodeGraph export JSON")
+    parser.add_argument("--input", required=True, help="Normalized CodeGraph MCP capture JSON")
     parser.add_argument("--output", required=True, help="Output code-facts.db")
     parser.add_argument("--manifest", help="Output code-manifest.json")
     parser.add_argument("--coverage", help="Output code-coverage.json")
@@ -228,9 +452,9 @@ def main() -> int:
         print(exc, file=sys.stderr)
         return 2
     if not isinstance(payload, dict):
-        print("CodeGraph export must be a JSON object.", file=sys.stderr)
+        print("CodeGraph MCP capture must be a JSON object.", file=sys.stderr)
         return 2
-    errors = validate(payload)
+    errors = validate(payload, input_path.parent)
     if errors:
         for error in errors:
             print(error, file=sys.stderr)
@@ -255,15 +479,32 @@ def main() -> int:
         if temp_path.exists():
             temp_path.unlink()
 
+    mcp_calls = payload.get("mcp_calls", [])
+    snapshot_status = (
+        "stale"
+        if any(
+            call.get("status") != "ok" or call.get("staleness") == "stale"
+            for call in mcp_calls
+        )
+        else "unknown"
+        if any(call.get("staleness") == "unknown" for call in mcp_calls)
+        else "fresh"
+    )
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "generated_at": payload.get("generated_at"),
-        "status": "fresh",
+        "status": snapshot_status,
+        "source": {
+            "kind": "codegraph-mcp",
+            **payload["mcp"],
+        },
+        "mcp_call_count": len(mcp_calls),
+        "query_seed_count": len(payload.get("query_seeds", [])),
         "repositories": payload["repositories"],
         "code_facts_db": str(output),
     }
     coverage = {
-        "schema_version": 1,
+        "schema_version": 2,
         "generated_at": payload.get("generated_at"),
         "repositories": [
             {
@@ -275,6 +516,17 @@ def main() -> int:
             }
             for repository in payload["repositories"]
         ],
+        "mcp_calls": [
+            {
+                "id": call["id"],
+                "repository": call["repository"],
+                "tool": call["tool"],
+                "status": call["status"],
+                "staleness": call["staleness"],
+            }
+            for call in mcp_calls
+        ],
+        "query_seeds": payload.get("query_seeds", []),
     }
     manifest_path.write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -286,6 +538,8 @@ def main() -> int:
         json.dumps(
             {
                 "repositories": len(payload["repositories"]),
+                "mcp_calls": len(payload.get("mcp_calls", [])),
+                "query_seeds": len(payload.get("query_seeds", [])),
                 "entities": len(payload["entities"]),
                 "relations": len(payload["relations"]),
                 "business_mappings": len(payload["business_mappings"]),

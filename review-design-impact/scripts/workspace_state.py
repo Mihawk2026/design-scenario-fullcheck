@@ -142,8 +142,13 @@ def inspect_code_snapshot(state_dir: Path) -> dict[str, Any]:
         snapshot["issues"].append("code snapshot contains no repositories")
         return snapshot
 
-    saw_unknown = False
-    saw_stale = False
+    manifest_status = manifest.get("status", "unknown")
+    if manifest_status not in {"fresh", "stale", "unknown"}:
+        snapshot["status"] = "invalid"
+        snapshot["issues"].append("code manifest status is invalid")
+        return snapshot
+    saw_unknown = manifest_status == "unknown"
+    saw_stale = manifest_status == "stale"
     for repository in repositories:
         if not isinstance(repository, dict):
             snapshot["status"] = "invalid"
@@ -199,7 +204,9 @@ def inspect_code_snapshot(state_dir: Path) -> dict[str, Any]:
 
     snapshot["status"] = "stale" if saw_stale else "unknown" if saw_unknown else "fresh"
     if saw_stale:
-        snapshot["issues"].append("one or more repositories changed after snapshot creation")
+        snapshot["issues"].append(
+            "the snapshot contains a stale or failed MCP call, or a repository changed"
+        )
     elif saw_unknown:
         snapshot["issues"].append("one or more repository revisions could not be verified")
     return snapshot

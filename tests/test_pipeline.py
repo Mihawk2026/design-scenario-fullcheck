@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 import sys
@@ -182,9 +183,24 @@ class PipelineTest(unittest.TestCase):
             self.assertEqual(quality["knowledge_tier_counts"]["conflict"], 1)
             self.assertEqual(len(quality["human_review_queue"]), 1)
 
+            capture_dir = state / "codegraph-mcp"
+            raw_dir = capture_dir / "raw"
+            raw_dir.mkdir(parents=True)
+            raw_response = raw_dir / "cg-0001.txt"
+            raw_response.write_text(
+                "Order status readers, writers, call paths, and blast radius.",
+                encoding="utf-8",
+            )
+            response_digest = hashlib.sha256(raw_response.read_bytes()).hexdigest()
             code_export = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "generated_at": "2026-07-22T10:00:00+00:00",
+                "mcp": {
+                    "server": "codegraph",
+                    "implementation": "colbymchenry/codegraph",
+                    "transport": "mcp",
+                    "tools_observed": ["codegraph_explore"],
+                },
                 "repositories": [
                     {
                         "name": "order-service",
@@ -195,6 +211,31 @@ class PipelineTest(unittest.TestCase):
                         "not_covered": ["scheduler-platform"],
                     }
                 ],
+                "mcp_calls": [
+                    {
+                        "id": "cg-0001",
+                        "repository": "order-service",
+                        "tool": "codegraph_explore",
+                        "arguments": {
+                            "query": "Trace order status readers and writers."
+                        },
+                        "response_path": "raw/cg-0001.txt",
+                        "response_sha256": response_digest,
+                        "observed_at": "2026-07-22T09:56:00+00:00",
+                        "status": "ok",
+                        "staleness": "fresh",
+                    }
+                ],
+                "query_seeds": [
+                    {
+                        "repository": "order-service",
+                        "category": "state",
+                        "seed": "Order.status / WAIT_PAY",
+                        "status": "matched",
+                        "mcp_call_ids": ["cg-0001"],
+                        "notes": "Reader and writer paths were returned.",
+                    }
+                ],
                 "entities": [
                     {
                         "id": "order-service:CloseExpiredOrderJob",
@@ -203,7 +244,10 @@ class PipelineTest(unittest.TestCase):
                         "service": "order-service",
                         "repository": "order-service",
                         "location": {"file": "src/jobs/CloseExpiredOrderJob.java", "line": 42},
-                        "evidence": {"kind": "codegraph", "confidence": "high"},
+                        "evidence": {
+                            "kind": "codegraph-mcp",
+                            "mcp_call_id": "cg-0001",
+                        },
                     }
                 ],
                 "relations": [
@@ -212,7 +256,10 @@ class PipelineTest(unittest.TestCase):
                         "type": "reads-state",
                         "target_id": "order-service:Order.status",
                         "repository": "order-service",
-                        "evidence": {"kind": "codegraph"},
+                        "evidence": {
+                            "kind": "codegraph-mcp",
+                            "mcp_call_id": "cg-0001",
+                        },
                     }
                 ],
                 "business_mappings": [
@@ -222,11 +269,14 @@ class PipelineTest(unittest.TestCase):
                         "action": "自动关单",
                         "asset_id": "order-service:CloseExpiredOrderJob",
                         "confidence": "high",
-                        "evidence": {"kind": "codegraph"},
+                        "evidence": {
+                            "kind": "codegraph-mcp",
+                            "mcp_call_id": "cg-0001",
+                        },
                     }
                 ],
             }
-            code_export_path = root / "code-export.json"
+            code_export_path = capture_dir / "capture.json"
             code_export_path.write_text(
                 json.dumps(code_export, ensure_ascii=False), encoding="utf-8"
             )
@@ -246,6 +296,9 @@ class PipelineTest(unittest.TestCase):
                 (state / "code-manifest.json").read_text(encoding="utf-8")
             )
             self.assertEqual(code_manifest["repositories"][0]["commit"], "abc123")
+            self.assertEqual(code_manifest["source"]["transport"], "mcp")
+            self.assertEqual(code_manifest["mcp_call_count"], 1)
+            self.assertEqual(code_manifest["query_seed_count"], 1)
 
             snapshot_state = run_script(
                 "workspace_state.py",
@@ -257,6 +310,47 @@ class PipelineTest(unittest.TestCase):
             self.assertEqual(session["code_snapshot_status"], "unknown")
             self.assertFalse(session["code_update_required"])
             self.assertNotIn("refresh_code_snapshot", session["next_actions"])
+
+            code_export["mcp_calls"][0]["status"] = "truncated"
+            code_export["query_seeds"][0]["status"] = "truncated"
+            code_export_path.write_text(
+                json.dumps(code_export, ensure_ascii=False), encoding="utf-8"
+            )
+            rejected_stale_confidence = run_script(
+                "compile_code_facts.py",
+                "--input",
+                str(code_export_path),
+                "--output",
+                str(code_database),
+            )
+            self.assertEqual(rejected_stale_confidence.returncode, 1)
+            self.assertIn(
+                "cannot be high confidence",
+                rejected_stale_confidence.stderr,
+            )
+
+            code_export["business_mappings"][0]["confidence"] = "medium"
+            code_export_path.write_text(
+                json.dumps(code_export, ensure_ascii=False), encoding="utf-8"
+            )
+            stale_compile = run_script(
+                "compile_code_facts.py",
+                "--input",
+                str(code_export_path),
+                "--output",
+                str(code_database),
+            )
+            self.assertEqual(stale_compile.returncode, 0, stale_compile.stderr)
+            stale_state = run_script(
+                "workspace_state.py",
+                "--workspace",
+                str(root),
+            )
+            self.assertEqual(stale_state.returncode, 0, stale_state.stderr)
+            session = json.loads((state / "session.json").read_text(encoding="utf-8"))
+            self.assertEqual(session["code_snapshot_status"], "stale")
+            self.assertTrue(session["code_update_required"])
+            self.assertIn("refresh_code_snapshot", session["next_actions"])
 
             spec = {
                 "title": "订单增加冻结能力",

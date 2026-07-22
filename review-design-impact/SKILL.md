@@ -1,6 +1,6 @@
 ---
 name: review-design-impact
-description: Automatically initialize or incrementally update a local historical-design knowledge base and an offline CodeGraph fact snapshot without RAG, find missing business scenarios, review design completeness, infer historically associated impacts, and decompose a change into per-microservice modification obligations. Use when a user naturally asks to initialize historical designs, refresh new documents or code revisions, design a requirement, check a design for omissions, estimate affected scenarios or services, or split a change across microservices. Perform discovery, history preparation, CodeGraph snapshot preparation, full-corpus analysis, and validation internally; do not require the user to run scripts or prepare structured data.
+description: Automatically initialize or incrementally update a local historical-design knowledge base and an offline code-fact snapshot collected through the colbymchenry/codegraph MCP server, without RAG. Find missing business scenarios, review design completeness, infer historically associated impacts, and decompose a change into per-microservice obligations. Use when a user naturally asks to initialize historical designs, refresh new documents or code revisions, design a requirement, check a design for omissions, estimate affected scenarios or services, or split a change across microservices. Perform MCP capability discovery, history and snapshot preparation, full-corpus analysis, and validation internally; do not require the user to run scripts or prepare structured data.
 ---
 
 # Review design impact
@@ -9,7 +9,7 @@ Provide a natural-language-only interface. The user describes a requirement or a
 
 Never ask the user to run a script, build a database, create JSON, configure RAG, or manually select historical cases. Ask only when no local design corpus can be found or an unresolved business choice would materially change the result.
 
-Treat local historical designs as a complete corpus, not a Top-K retrieval source. Access CodeGraph only while initializing or incrementally updating generated state. During design, review, and decomposition, use only the compiled offline code-fact snapshot. Absence of a code fact is not proof of no business impact.
+Treat local historical designs as a complete corpus, not a Top-K retrieval source. Integrate specifically with the MCP server from `colbymchenry/codegraph`. Treat it as an MCP server, not as a bulk-export API or a database to read directly. Call its MCP tools only while initializing or incrementally updating generated state. During design, review, and decomposition, use only the compiled offline code-fact snapshot. Absence of a code fact is not proof of no business impact.
 
 ## Interpret the request
 
@@ -48,7 +48,9 @@ When multiple unrelated document roots exist and choosing one would change the b
 
 Store generated state under `<workspace>/.design-impact/`. Never modify source design documents.
 
-Read the `code_snapshot_status` and `code_update_required` fields in `.design-impact/session.json` before analysis. The only phases permitted to query CodeGraph are **Initialize history** and **Incremental update**. If a review request finds a missing, stale, or invalid snapshot and CodeGraph is available, temporarily enter incremental-update mode, refresh the snapshot, then resume the review. Never query live CodeGraph from steps 3 through 8.
+Resolve service-to-repository paths automatically from the workspace, nearby repositories, historical evidence, and existing `.design-impact/repository-map.json`. Save the inferred mapping there. Ask one concise mapping question only when an unresolved path would exclude a material service from initialization; otherwise mark it `not-queried`.
+
+Read the `code_snapshot_status` and `code_update_required` fields in `.design-impact/session.json` before analysis. Discover the CodeGraph tools already exposed by the MCP host; callable names may be namespaced. The only phases permitted to call them are **Initialize history** and **Incremental update**. If a review request finds a missing, stale, or invalid snapshot and CodeGraph MCP is available, temporarily enter incremental-update mode, refresh the snapshot, then resume the review. Never call CodeGraph MCP from steps 3 through 8.
 
 ### 2. Prepare or refresh history and code facts automatically
 
@@ -72,15 +74,19 @@ If the initial corpus is large, provide brief progress updates and continue in b
 
 After all pending documents are processed and verified, run `scripts/compile_history.py` internally to rebuild `.design-impact/history.db` and its quality report. SQLite is generated state; extracted cases and original documents remain the evidence sources.
 
-Read [references/code-fact-schema.md](references/code-fact-schema.md). When CodeGraph is available, prepare the code-fact snapshot in this phase only:
+Read [references/code-fact-schema.md](references/code-fact-schema.md). When CodeGraph MCP is available, prepare the code-fact snapshot in this phase only:
 
-- On full initialization, export the business-impact projection for every in-scope repository, including repository path, branch, commit, index time, covered surfaces, uncovered surfaces, services, APIs, events, tables, jobs, entry points, and their relations.
-- On incremental update, compare current repository branch and commit with `.design-impact/code-manifest.json`; query CodeGraph only for added or changed repositories and changed graph content, then rebuild the consolidated export.
-- Compile the export with `scripts/compile_code_facts.py` into `.design-impact/code-facts.db`, `.design-impact/code-manifest.json`, and `.design-impact/code-coverage.json`.
-- Preserve repository, branch, commit, file location, and CodeGraph evidence in every compiled fact. Record partial indexing and unsupported technical surfaces instead of implying full coverage.
-- If CodeGraph is unavailable, do not block historical-document initialization. Record the snapshot as unavailable and make that evidence limitation explicit.
+- Build technical query seeds from verified historical cases. Do not ask CodeGraph to discover business relationships that exist only in design history.
+- Prefer the exposed `codegraph_explore` tool from `colbymchenry/codegraph`. It is sufficient by itself; use optional status, search, node, caller, callee, impact, or file tools only when already exposed through `CODEGRAPH_MCP_TOOLS`.
+- On full initialization, query every in-scope indexed repository using `projectPath` when supported. Batch related seeds and collect observed source, call paths, blast radius, entry points, routes, events, jobs, and persistence access.
+- On incremental update, compare repository branch and commit with `.design-impact/code-manifest.json`, then repeat MCP queries only for changed repositories, changed historical seeds, stale responses, ambiguous results, and previously truncated results.
+- Save each exact MCP response under `.design-impact/codegraph-mcp/raw/`. Record tool name, arguments, response hash, repository, observation time, status, and staleness in the normalized capture file.
+- Capture CodeGraph pending-sync or staleness banners. Do not promote stale observations to high-confidence facts. Do not re-check results with grep, direct source reads, CodeGraph CLI commands, or `.codegraph` database access.
+- Compile the normalized MCP capture with `scripts/compile_code_facts.py` into `.design-impact/code-facts.db`, `.design-impact/code-manifest.json`, and `.design-impact/code-coverage.json`.
+- Record `matched`, `not-found`, `ambiguous`, `truncated`, and `not-queried` seeds. CodeGraph MCP is query-oriented, so never claim full code coverage merely because all calls succeeded.
+- If the MCP tool list is absent or the index is inactive, do not block historical-document initialization and do not initialize an index implicitly. Record code grounding as unavailable.
 
-When initialization or incremental update is the user's primary request, stop after successful compilation and report document counts, reused and re-extracted counts, failures, trusted/candidate/conflict/rejected case counts, compiled scenario/service counts, the human-review queue, CodeGraph snapshot repositories and commits, snapshot coverage gaps, and the state location. Do not require a design-review request in the same turn.
+When initialization or incremental update is the user's primary request, stop after successful compilation and report document counts, reused and re-extracted counts, failures, trusted/candidate/conflict/rejected case counts, compiled scenario/service counts, the human-review queue, observed MCP tools and call counts, snapshot repositories and commits, stale or truncated calls, query coverage gaps, and the state location. Do not require a design-review request in the same turn.
 
 ### 3. Build the current ChangeSpec
 
@@ -108,7 +114,7 @@ Use knowledge tiers in every conclusion:
 - `conflict` evidence must become an explicit design question with all sides shown.
 - `rejected` evidence must not influence design conclusions.
 
-Read `.design-impact/code-facts.db`, `.design-impact/code-manifest.json`, and `.design-impact/code-coverage.json` as immutable inputs for this review. Do not access CodeGraph or inspect live code repositories. Use positive snapshot facts to confirm historical candidates or add technical candidates. Never remove a historically or semantically supported candidate because the snapshot has no corresponding entity or relation.
+Read `.design-impact/code-facts.db`, `.design-impact/code-manifest.json`, and `.design-impact/code-coverage.json` as immutable inputs for this review. Do not call CodeGraph MCP, use CodeGraph CLI, read its database, or inspect live code repositories. Use positive snapshot facts to confirm historical candidates or add technical candidates. Never remove a historically or semantically supported candidate because the snapshot has no corresponding entity or relation.
 
 ### 5. Expand expected scenarios
 
@@ -169,7 +175,8 @@ Keep severity separate from confidence. Label general-rule-only findings `unveri
 - If generated state is absent, initialize it automatically.
 - If source hashes changed, refresh only affected cases and rebuild generated aggregates.
 - If a case is invalid, repair or re-extract it from the source document.
-- If the code snapshot is missing, stale, or invalid and CodeGraph is available, refresh it in incremental-update mode before review.
+- If the code snapshot is missing, stale, or invalid and CodeGraph MCP is available, refresh it in incremental-update mode before review.
 - If snapshot freshness is unknown because local repository revisions cannot be inspected, do not enter a refresh loop. Use the snapshot with an explicit `unknown` freshness label.
-- If CodeGraph is unavailable, complete the business review and identify offline code grounding as unavailable or stale. Never substitute a live repository inspection during review.
+- If CodeGraph MCP exposes no tools because an index is absent or inactive, complete the business review and identify offline code grounding as unavailable. Never initialize, delete, or repair its index implicitly.
+- If CodeGraph MCP is otherwise unavailable, complete the business review and identify offline code grounding as unavailable or stale. Never substitute a CLI or live repository inspection during review.
 - If a document cannot be parsed, report that specific evidence gap without blocking analysis of the rest of the corpus.
