@@ -1,6 +1,6 @@
 ---
 name: review-design-impact
-description: Automatically analyze local historical design documents without RAG, find missing business scenarios, review design completeness, infer historically associated impacts, and decompose a change into per-microservice modification obligations. Use when a user naturally asks to design a requirement, check a design for omissions, estimate affected scenarios or services, or split a change across microservices. Perform document discovery, incremental history preparation, full-corpus analysis, CodeGraph grounding, and validation internally; do not require the user to run scripts or prepare structured data.
+description: Automatically initialize or incrementally update a local historical-design knowledge base without RAG, find missing business scenarios, review design completeness, infer historically associated impacts, and decompose a change into per-microservice modification obligations. Use when a user naturally asks to initialize historical designs, refresh newly added or changed documents, design a requirement, check a design for omissions, estimate affected scenarios or services, or split a change across microservices. Perform document discovery, history preparation, full-corpus analysis, CodeGraph grounding, and validation internally; do not require the user to run scripts or prepare structured data.
 ---
 
 # Review design impact
@@ -15,10 +15,11 @@ Treat local historical designs as a complete corpus, not a Top-K retrieval sourc
 
 Infer one or more modes from natural language:
 
+- **Initialize history**: analyze all historical documents and build first-use local state.
+- **Incremental update**: detect added, changed, moved, or removed documents and refresh affected cases.
 - **Design**: analyze impact first, then produce or improve the design.
 - **Review**: check an existing design for missing or conflicting obligations.
 - **Decompose**: split the change into per-microservice modification contracts.
-- **Refresh history**: rescan changed local design documents.
 
 Accept prompts such as:
 
@@ -26,6 +27,8 @@ Accept prompts such as:
 - "Check this design for missing scenarios."
 - "Which microservices need changes for this requirement?"
 - "Use the historical designs in this directory to review the current solution."
+- "Initialize the historical designs in this directory."
+- "Incrementally update the history after I added new design documents."
 
 Do not make the user choose a mode when the intent is clear.
 
@@ -61,6 +64,8 @@ Read `.design-impact/session.json` produced by `workspace_state.py`.
 If the initial corpus is large, provide brief progress updates and continue in batches. Do not transfer pipeline operation to the user.
 
 After all pending documents are processed, run `scripts/compile_history.py` internally to rebuild `.design-impact/history.db`. SQLite is generated state; extracted cases and original documents remain the evidence sources.
+
+When initialization or incremental update is the user's primary request, stop after successful compilation and report document counts, reused and re-extracted counts, failures, compiled case/scenario/service counts, and the state location. Do not require a design-review request in the same turn.
 
 ### 3. Build the current ChangeSpec
 
