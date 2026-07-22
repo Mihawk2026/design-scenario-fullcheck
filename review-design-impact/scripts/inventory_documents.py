@@ -27,7 +27,9 @@ DEFAULT_EXTENSIONS = {
 }
 
 VERSION_RE = re.compile(
-    r"(?i)(?:^|[\s._-])((?:v|version)[\s._-]*\d+(?:[._-]\d+)*)"
+    r"(?i)(?:^|[\s._-])((?:v|version|版本|版)[\s._-]*"
+    r"(?:\d+(?:[._-]\d+)*|[一二三四五六七八九十]+)"
+    r"|20\d{2}[._-]\d{1,2}(?:[._-]\d{1,2})?)"
 )
 
 
@@ -49,6 +51,35 @@ def load_previous(path: Path | None) -> dict[str, dict[str, Any]]:
         return {}
     payload = json.loads(path.read_text(encoding="utf-8"))
     return {entry["path"]: entry for entry in payload.get("documents", [])}
+
+
+def detect_moves(
+    current: dict[str, dict[str, Any]],
+    previous: dict[str, dict[str, Any]],
+    added_paths: set[str],
+    removed_paths: set[str],
+) -> list[dict[str, str]]:
+    added_by_hash: dict[str, list[str]] = {}
+    removed_by_hash: dict[str, list[str]] = {}
+    for path in added_paths:
+        added_by_hash.setdefault(current[path]["sha256"], []).append(path)
+    for path in removed_paths:
+        digest = previous[path].get("sha256")
+        if isinstance(digest, str):
+            removed_by_hash.setdefault(digest, []).append(path)
+    moves: list[dict[str, str]] = []
+    for digest in sorted(added_by_hash.keys() & removed_by_hash.keys()):
+        destinations = added_by_hash[digest]
+        sources = removed_by_hash[digest]
+        if len(destinations) == 1 and len(sources) == 1:
+            moves.append(
+                {
+                    "from": previous[sources[0]]["path"],
+                    "to": current[destinations[0]]["path"],
+                    "sha256": digest,
+                }
+            )
+    return moves
 
 
 def is_excluded(relative_path: str, patterns: list[str]) -> bool:
@@ -136,8 +167,13 @@ def main() -> int:
 
     documents.sort(key=lambda entry: entry["path"].casefold())
     current = {entry["path"]: entry for entry in documents}
-    added = sorted(path for path in current if path not in previous)
-    removed = sorted(path for path in previous if path not in current)
+    added_paths = {path for path in current if path not in previous}
+    removed_paths = {path for path in previous if path not in current}
+    moved = detect_moves(current, previous, added_paths, removed_paths)
+    moved_from = {item["from"] for item in moved}
+    moved_to = {item["to"] for item in moved}
+    added = sorted(added_paths - moved_to)
+    removed = sorted(removed_paths - moved_from)
     changed = sorted(
         path
         for path in current.keys() & previous.keys()
@@ -160,6 +196,7 @@ def main() -> int:
             "changed": changed,
             "unchanged": unchanged,
             "removed": removed,
+            "moved": moved,
         },
         "errors": errors,
     }
@@ -175,6 +212,7 @@ def main() -> int:
                 "changed": len(changed),
                 "unchanged": len(unchanged),
                 "removed": len(removed),
+                "moved": len(moved),
                 "errors": len(errors),
                 "output": str(output),
             },

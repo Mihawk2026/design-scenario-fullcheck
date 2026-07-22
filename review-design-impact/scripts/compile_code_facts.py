@@ -68,6 +68,10 @@ CREATE TABLE relations (
     relation_type TEXT NOT NULL,
     target_id TEXT NOT NULL,
     repository TEXT,
+    source_external INTEGER NOT NULL,
+    target_external INTEGER NOT NULL,
+    source_repository TEXT,
+    target_repository TEXT,
     evidence_json TEXT NOT NULL
 );
 CREATE INDEX idx_relations_source ON relations(source_id, relation_type);
@@ -294,6 +298,22 @@ def validate(payload: dict[str, Any], capture_root: Path) -> list[str]:
         validate_mcp_evidence(
             relation.get("evidence"), f"relations[{index}]", call_ids, errors
         )
+        source_id = relation.get("source_id")
+        target_id = relation.get("target_id")
+        source_external = relation.get("source_external") is True
+        target_external = relation.get("target_external") is True
+        if source_id not in entity_ids and not source_external:
+            errors.append(
+                f"relations[{index}].source_id is undeclared; mark source_external=true"
+            )
+        if target_id not in entity_ids and not target_external:
+            errors.append(
+                f"relations[{index}].target_id is undeclared; mark target_external=true"
+            )
+        if source_external and not relation.get("source_repository"):
+            errors.append(f"relations[{index}].source_repository is required")
+        if target_external and not relation.get("target_repository"):
+            errors.append(f"relations[{index}].target_repository is required")
 
     for index, mapping in enumerate(mappings):
         if not isinstance(mapping, dict):
@@ -301,6 +321,10 @@ def validate(payload: dict[str, Any], capture_root: Path) -> list[str]:
             continue
         if not mapping.get("asset_id"):
             errors.append(f"business_mappings[{index}].asset_id is required")
+        elif mapping.get("asset_id") not in entity_ids:
+            errors.append(
+                f"business_mappings[{index}].asset_id is not a declared entity"
+            )
         if not any(mapping.get(field) for field in ("business_object", "state", "action")):
             errors.append(
                 f"business_mappings[{index}] requires business_object, state, or action"
@@ -398,13 +422,18 @@ def insert_payload(connection: sqlite3.Connection, payload: dict[str, Any]) -> N
     for relation in payload["relations"]:
         connection.execute(
             """INSERT INTO relations(
-                source_id, relation_type, target_id, repository, evidence_json
-            ) VALUES(?,?,?,?,?)""",
+                source_id, relation_type, target_id, repository, source_external,
+                target_external, source_repository, target_repository, evidence_json
+            ) VALUES(?,?,?,?,?,?,?,?,?)""",
             (
                 relation["source_id"],
                 relation["type"],
                 relation["target_id"],
                 relation.get("repository"),
+                int(relation.get("source_external") is True),
+                int(relation.get("target_external") is True),
+                relation.get("source_repository"),
+                relation.get("target_repository"),
                 json_text(relation.get("evidence", {})),
             ),
         )

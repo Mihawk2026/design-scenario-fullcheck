@@ -83,6 +83,15 @@ Save exact MCP responses under `.design-impact/codegraph-mcp/raw/`. Create a nor
       "repository": "order-service",
       "location": {"file": "src/jobs/CloseExpiredOrderJob.java", "line": 42},
       "evidence": {"kind": "codegraph-mcp", "mcp_call_id": "cg-0001"}
+    },
+    {
+      "id": "order-service:Order.status",
+      "type": "field",
+      "name": "Order.status",
+      "service": "order-service",
+      "repository": "order-service",
+      "location": {"file": "src/domain/Order.java", "line": 18},
+      "evidence": {"kind": "codegraph-mcp", "mcp_call_id": "cg-0001"}
     }
   ],
   "relations": [
@@ -107,7 +116,7 @@ Save exact MCP responses under `.design-impact/codegraph-mcp/raw/`. Create a nor
 }
 ```
 
-Relations may reference stable external IDs omitted from the captured entity list.
+Relations may reference a stable ID omitted from the entity list only when the corresponding `source_external` or `target_external` flag is `true` and `source_repository` or `target_repository` identifies that endpoint's repository. Business mappings must always reference a declared entity.
 
 ## Compilation and runtime boundary
 

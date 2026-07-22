@@ -39,8 +39,8 @@ Do not make the user choose a mode when the intent is clear.
 Identify the current requirement or design from the conversation, attachments, or workspace. If the user supplied a historical-document path, use it. Otherwise:
 
 1. Run `scripts/workspace_state.py` from the active workspace.
-2. Let it discover design-like Markdown, text, HTML, JSON, YAML, Word, and PDF documents.
-3. Prefer directories and names containing design, documentation, architecture, ADR, RFC, solution, change, or requirement terms in the project's language. The bundled discovery script includes common English and Chinese terms.
+2. Let it discover all supported Markdown, text, HTML, JSON, YAML, Word, and PDF documents. Names and directories are ranking hints only; never exclude a supported document merely because its path lacks a design keyword.
+3. Prefer directories and names containing design, documentation, architecture, ADR, RFC, solution, change, or requirement terms in the project's language when ordering work. The bundled discovery script includes common English and Chinese terms.
 4. Exclude generated state, dependency, build, vendor, and VCS directories.
 5. If no design-like files exist, fall back to other supported documents in the workspace.
 
@@ -58,12 +58,16 @@ Read `.design-impact/session.json` produced by `workspace_state.py`.
 
 Read [references/knowledge-quality-gates.md](references/knowledge-quality-gates.md) before extracting or promoting historical knowledge. Treat historical documents as evidence, not ground truth.
 
+Before extraction, run `scripts/reconcile_cases.py` with `.design-impact/cases/` and `.design-impact/manifest.json`. This deterministically migrates uniquely hash-matched moves, removes cases for deleted or changed documents, and rewrites `.design-impact/case-index.json`. Never leave lifecycle cleanup to prompt interpretation.
+
+Because discovery favors recall, classify every pending supported document by reading its content before ChangeCase extraction. Use [references/document-decision-schema.md](references/document-decision-schema.md) to checkpoint confirmed non-design files in `.design-impact/document-decisions.json`; never invent an empty ChangeCase for configuration or unrelated documentation. Re-run `workspace_state.py` after updating decisions. A generic filename is not enough to classify a document as non-design.
+
 - Reuse unchanged extracted cases.
 - Analyze every document in `pending_extraction` without asking the user to preprocess it.
 - Use available document or PDF extraction capabilities for binary formats.
-- In pass 1, extract one or more document-local ChangeCase objects using [references/change-case-schema.md](references/change-case-schema.md). Do not use other documents to fill omissions in the source document.
+- In pass 1, extract one or more document-local ChangeCase objects using [references/change-case-schema.md](references/change-case-schema.md). Do not use other documents to fill omissions in the source document. Record a unique extraction run ID, executor, completion time, source hash, and processing outcome before checkpointing.
 - Preserve original terms, source path, SHA-256, version, section or page, and explicit-versus-inferred evidence.
-- In pass 2, independently reread the source and verify each object, scenario, service change, relation, and evidence location. Do not validate from the extracted JSON alone.
+- In pass 2, start a separate review context from the source and schema, independently reread the source, and verify each object, scenario, service change, relation, and evidence location. Do not validate from the extracted JSON alone. Use a different run ID and record reviewer, review time, reviewed source hash, `independent_context=true`, and the verified fields.
 - Mark each case `validated`, `partial`, `unverified`, `conflict`, or `rejected`; record validation issues and confidence.
 - Write cases under `.design-impact/cases/` and checkpoint after each document.
 - Link versions with `supersedes`; treat later additions as review candidates, not automatic omissions.
@@ -72,7 +76,7 @@ Read [references/knowledge-quality-gates.md](references/knowledge-quality-gates.
 
 If the initial corpus is large, provide brief progress updates and continue in batches. Do not transfer pipeline operation to the user.
 
-After all pending documents are processed and verified, run `scripts/compile_history.py` internally to rebuild `.design-impact/history.db` and its quality report. SQLite is generated state; extracted cases and original documents remain the evidence sources.
+After all pending documents are processed and verified, run `scripts/reconcile_cases.py` again, then run `scripts/compile_history.py --manifest .design-impact/manifest.json` internally to rebuild `.design-impact/history.db` and its quality report. The manifest filter is a second stale-knowledge defense. SQLite is generated state; extracted cases and original documents remain the evidence sources.
 
 Read [references/code-fact-schema.md](references/code-fact-schema.md). When CodeGraph MCP is available, prepare the code-fact snapshot in this phase only:
 
@@ -103,9 +107,13 @@ Write the generated specification to `.design-impact/current-change.json` for re
 
 ### 4. Scan the complete compiled history
 
-Run `scripts/analyze_impact.py` internally against `.design-impact/history.db`. Inspect all compiled cases and retain every match reason. Never truncate results using similarity Top-K.
+Run `scripts/analyze_impact.py` internally with `.design-impact/history.db`, `.design-impact/current-change.json`, and (when present) `.design-impact/code-facts.db`. Inspect all compiled cases and retain every match reason. Never truncate results using similarity Top-K.
 
-Match independently on business object, capability, action, state, change type, invariant, rule, and historical service co-change. Use normalized aliases for terminology differences.
+Match independently on business object, capability, action, state, change type, invariant, rule, and before/after behavior. Use NFKC normalization, aliases, containment, and lexical overlap with field-specific weights. Preserve the score and the exact terms that caused every match; semantic-looking similarity without an explainable term path is not evidence.
+
+Traverse compiled historical relations for a bounded number of hops to discover related cases. Mark relation-propagated cases as candidates even when their source case is trusted. Traverse only the offline code snapshot's declared entity relations, and retain entity IDs and MCP evidence.
+
+Treat historical service co-occurrence as a weak signal. Expand a service only when it co-occurred in at least two cases, has sufficient trusted-case ratio, and the current business context overlaps; otherwise report the co-change statistic without adding the service as an obligation.
 
 Use knowledge tiers in every conclusion:
 
@@ -153,7 +161,9 @@ Before completion, answer:
 
 Build the machine-readable report using [references/report-schema.md](references/report-schema.md), save it under `.design-impact/reports/`, and run `scripts/validate_review.py` internally.
 
-Do not claim completion while validation errors remain. Fix structural errors automatically. Present unresolved business decisions as concise open questions.
+Do not claim completion while validation errors remain. Fix structural and evidence-reference errors automatically. The validator rejects duplicate scenario/service rows, dangling trace IDs, historical evidence without case IDs, code evidence without entity IDs, and a source of truth outside the reviewed services. Present unresolved business decisions as concise open questions.
+
+If `.design-impact/replay-dataset.json` exists, or the user asks to evaluate reliability, read [references/replay-evaluation-schema.md](references/replay-evaluation-schema.md) and run `scripts/evaluate_replay.py`. Do not lower thresholds merely to make the run pass. Report scenario/service recall and precision, evidence precision, and the exact replay cases that regressed. Expected labels must come from accepted final designs, incidents, defects, or SE review—not from the current analyzer output.
 
 ## Response contract
 
@@ -174,6 +184,8 @@ Keep severity separate from confidence. Label general-rule-only findings `unveri
 
 - If generated state is absent, initialize it automatically.
 - If source hashes changed, refresh only affected cases and rebuild generated aggregates.
+- If a document moved, migrate cases only when the content hash has one unique destination. Ambiguous moves are re-extracted.
+- If a document was modified or deleted, reconcile and invalidate its old cases before compilation; never rely on the extractor to overwrite them correctly.
 - If a case is invalid, repair or re-extract it from the source document.
 - If the code snapshot is missing, stale, or invalid and CodeGraph MCP is available, refresh it in incremental-update mode before review.
 - If snapshot freshness is unknown because local repository revisions cannot be inspected, do not enter a refresh loop. Use the snapshot with an explicit `unknown` freshness label.

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import itertools
 import json
 import os
@@ -127,6 +128,7 @@ def validate_case(case: dict[str, Any], origin: Path) -> list[str]:
     if not require_list(case, "change_types"):
         errors.append("change_types must not be empty")
     validation = case.get("validation")
+    extraction = case.get("extraction")
     validation_status = None
     if not isinstance(validation, dict):
         errors.append("validation must be an object")
@@ -140,6 +142,35 @@ def validate_case(case: dict[str, Any], origin: Path) -> list[str]:
             errors.append("validated cases require validation.method")
         if validation_status == "validated" and require_list(case, "uncertain_fields"):
             errors.append("validated cases cannot contain uncertain_fields; use partial")
+        if validation_status == "validated":
+            if not isinstance(extraction, dict):
+                errors.append("validated cases require extraction provenance")
+            else:
+                for field in ("run_id", "executor", "completed_at"):
+                    if not extraction.get(field):
+                        errors.append(f"validated cases require extraction.{field}")
+            for field in (
+                "run_id",
+                "reviewer",
+                "reviewed_at",
+                "source_sha256",
+            ):
+                if not validation.get(field):
+                    errors.append(f"validated cases require validation.{field}")
+            if validation.get("independent_context") is not True:
+                errors.append("validated cases require validation.independent_context=true")
+            if not isinstance(validation.get("verified_fields"), list) or not validation.get(
+                "verified_fields"
+            ):
+                errors.append("validated cases require non-empty validation.verified_fields")
+            if isinstance(extraction, dict) and extraction.get("run_id") == validation.get(
+                "run_id"
+            ):
+                errors.append("extraction and validation run_id must differ")
+            if isinstance(source, dict) and validation.get("source_sha256", "").casefold() != source.get(
+                "sha256", ""
+            ).casefold():
+                errors.append("validation.source_sha256 must match source.sha256")
     scenarios = case.get("scenarios", [])
     service_changes = case.get("service_changes", [])
     if not isinstance(scenarios, list):
@@ -163,6 +194,22 @@ def validate_case(case: dict[str, Any], origin: Path) -> list[str]:
         for index, item in enumerate(require_list(case, field)):
             if isinstance(item, dict) and validation_status != "rejected":
                 errors.extend(evidence_errors(item.get("evidence"), f"{field}[{index}]"))
+            if field == "relations" and isinstance(item, dict):
+                if not all(item.get(key) for key in ("source", "type", "target")):
+                    errors.append(f"relations[{index}] requires source, type, and target")
+                if item.get("direction", "forward") not in {"forward", "bidirectional"}:
+                    errors.append(f"relations[{index}].direction is invalid")
+                if item.get("propagation", "bidirectional") not in {
+                    "forward",
+                    "reverse",
+                    "bidirectional",
+                    "none",
+                }:
+                    errors.append(f"relations[{index}].propagation is invalid")
+                if not isinstance(item.get("conditions", []), list):
+                    errors.append(f"relations[{index}].conditions must be a list")
+                if not isinstance(item.get("version_scope", {}), dict):
+                    errors.append(f"relations[{index}].version_scope must be an object")
     unresolved_conflicts = 0
     for index, conflict in enumerate(require_list(case, "conflicts")):
         if not isinstance(conflict, dict) or not conflict.get("topic"):
@@ -189,9 +236,12 @@ def validate_case(case: dict[str, Any], origin: Path) -> list[str]:
     return [f"{origin}: {case_id or '<unknown>'}: {error}" for error in errors]
 
 
-def collect_cases(root: Path) -> tuple[list[dict[str, Any]], list[str]]:
+def collect_cases(
+    root: Path, active: dict[str, str] | None = None
+) -> tuple[list[dict[str, Any]], list[str], int]:
     cases: list[dict[str, Any]] = []
     errors: list[str] = []
+    skipped_stale = 0
     seen_ids: dict[str, Path] = {}
     paths = sorted(
         [*root.rglob("*.json"), *root.rglob("*.jsonl")],
@@ -204,6 +254,15 @@ def collect_cases(root: Path) -> tuple[list[dict[str, Any]], list[str]]:
             errors.append(f"{path}: {exc}")
             continue
         for case in loaded:
+            if active is not None:
+                source = case.get("source")
+                if isinstance(source, dict) and isinstance(source.get("path"), str) and isinstance(
+                    source.get("sha256"), str
+                ):
+                    key = str(Path(source["path"]).resolve()).casefold()
+                    if active.get(key) != source["sha256"].casefold():
+                        skipped_stale += 1
+                        continue
             case_errors = validate_case(case, path)
             errors.extend(case_errors)
             case_id = case.get("case_id")
@@ -216,7 +275,20 @@ def collect_cases(root: Path) -> tuple[list[dict[str, Any]], list[str]]:
                     seen_ids[case_id] = path
             if not case_errors:
                 cases.append(case)
-    return cases, errors
+    return cases, errors, skipped_stale
+
+
+def active_sources(path: Path) -> dict[str, str]:
+    payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    result: dict[str, str] = {}
+    for document in payload.get("documents", []):
+        if not isinstance(document, dict):
+            continue
+        source_path = document.get("path")
+        digest = document.get("sha256")
+        if isinstance(source_path, str) and isinstance(digest, str):
+            result[str(Path(source_path).resolve()).casefold()] = digest.casefold()
+    return result
 
 
 SCHEMA = """
@@ -274,10 +346,17 @@ CREATE TABLE service_changes (
 CREATE INDEX idx_service_changes_service ON service_changes(normalized_service);
 CREATE TABLE relations (
     relation_id INTEGER PRIMARY KEY,
+    stable_id TEXT NOT NULL UNIQUE,
     case_id TEXT NOT NULL,
+    source_id TEXT NOT NULL,
     source TEXT NOT NULL,
     relation_type TEXT NOT NULL,
+    target_id TEXT NOT NULL,
     target TEXT NOT NULL,
+    direction TEXT NOT NULL,
+    propagation TEXT NOT NULL,
+    conditions_json TEXT NOT NULL,
+    version_scope_json TEXT NOT NULL,
     knowledge_tier TEXT NOT NULL,
     evidence_json TEXT NOT NULL,
     FOREIGN KEY (case_id) REFERENCES cases(case_id) ON DELETE CASCADE
@@ -312,6 +391,25 @@ CREATE TABLE conflicts (
 
 def json_text(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+
+def stable_term_id(value: str) -> str:
+    digest = hashlib.sha256(normalized(value).encode("utf-8")).hexdigest()[:20]
+    return f"business-term:{digest}"
+
+
+def stable_relation_id(case_id: str, relation: dict[str, Any]) -> str:
+    identity = "|".join(
+        (
+            case_id,
+            normalized(str(relation["source"])),
+            normalized(str(relation["type"])),
+            normalized(str(relation["target"])),
+            str(relation.get("direction", "forward")),
+            str(relation.get("propagation", "bidirectional")),
+        )
+    )
+    return f"history-relation:{hashlib.sha256(identity.encode('utf-8')).hexdigest()[:24]}"
 
 
 def insert_cases(connection: sqlite3.Connection, cases: Iterable[dict[str, Any]]) -> None:
@@ -413,14 +511,23 @@ def insert_cases(connection: sqlite3.Connection, cases: Iterable[dict[str, Any]]
                 continue
             if all(relation.get(key) for key in ("source", "type", "target")):
                 connection.execute(
-                    """INSERT INTO relations(
-                        case_id, source, relation_type, target, knowledge_tier, evidence_json
-                    ) VALUES(?,?,?,?,?,?)""",
+                    """INSERT OR IGNORE INTO relations(
+                        stable_id, case_id, source_id, source, relation_type,
+                        target_id, target, direction, propagation, conditions_json,
+                        version_scope_json, knowledge_tier, evidence_json
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
+                        stable_relation_id(case_id, relation),
                         case_id,
+                        stable_term_id(str(relation["source"])),
                         relation["source"],
                         relation["type"],
+                        stable_term_id(str(relation["target"])),
                         relation["target"],
+                        relation.get("direction", "forward"),
+                        relation.get("propagation", "bidirectional"),
+                        json_text(relation.get("conditions", [])),
+                        json_text(relation.get("version_scope", {})),
                         item_tier(case_tier, relation.get("evidence")),
                         json_text(relation.get("evidence", {})),
                     ),
@@ -516,13 +623,25 @@ def main() -> int:
     )
     parser.add_argument("--cases", required=True, help="Directory containing JSON/JSONL cases")
     parser.add_argument("--output", required=True, help="Output SQLite path")
+    parser.add_argument(
+        "--manifest",
+        help="Active document manifest; stale or removed-source cases are excluded",
+    )
     args = parser.parse_args()
 
     case_root = Path(args.cases).resolve()
     if not case_root.is_dir():
         print(f"Case directory not found: {case_root}", file=sys.stderr)
         return 2
-    cases, errors = collect_cases(case_root)
+    active: dict[str, str] | None = None
+    if args.manifest:
+        manifest_path = Path(args.manifest).resolve()
+        try:
+            active = active_sources(manifest_path)
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+            print(exc, file=sys.stderr)
+            return 2
+    cases, errors, skipped_stale = collect_cases(case_root, active)
     if errors:
         for error in errors:
             print(error, file=sys.stderr)
@@ -564,6 +683,7 @@ def main() -> int:
                 "cases": len(cases),
                 "knowledge_tiers": quality_report["knowledge_tier_counts"],
                 "human_review_queue": len(quality_report["human_review_queue"]),
+                "skipped_stale_cases": skipped_stale,
                 "output": str(output),
                 "quality_report": str(quality_path),
             },

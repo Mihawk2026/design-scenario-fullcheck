@@ -34,6 +34,7 @@ Produce human-readable tables and this machine-readable JSON shape.
       "evidence": [
         {
           "type": "historical",
+          "case_id": "order-freeze-v2",
           "source": "D:/designs/order-freeze-v2.docx",
           "location": "异常场景/并发处理"
         }
@@ -52,7 +53,12 @@ Produce human-readable tables and this machine-readable JSON shape.
       "compatibility": ["兼容订单服务灰度"],
       "observability": ["记录冻结支付拒绝次数"],
       "tests": ["冻结与支付并发"],
-      "evidence": []
+      "evidence": [
+        {
+          "type": "historical",
+          "case_id": "order-freeze-v2"
+        }
+      ]
     }
   ],
   "cross_service_review": {
@@ -92,7 +98,15 @@ Produce human-readable tables and this machine-readable JSON shape.
     }
   ],
   "open_questions": [],
-  "evidence_trace": []
+  "evidence_trace": [
+    {
+      "id": "history-order-freeze-v2",
+      "type": "historical",
+      "source": "D:/designs/order-freeze-v2.docx",
+      "source_sha256": "document-sha256",
+      "location": "异常场景/并发处理"
+    }
+  ]
 }
 ```
 
@@ -127,6 +141,17 @@ Knowledge tier:
 - `conflict`
 - `heuristic`
 
+Service status:
+
+- `confirmed`
+- `historical-candidate`
+- `code-candidate`
+- `partial`
+- `missing`
+- `conflict`
+- `unverified`
+- `not-applicable`
+
 ## Completion rules
 
 - Every scenario must have a status.
@@ -138,4 +163,8 @@ Knowledge tier:
 - Every non-trusted scenario or service must set `requires_confirmation` to true.
 - Every knowledge conflict must preserve at least two claims and their sources.
 - Every service must contain a reason, modification list, test list, and evidence field.
+- Historical evidence must name a compiled `case_id`; offline-code evidence must name `entity_id` or `entity_ids`.
+- If inline evidence uses `trace_id`, the ID must exist exactly once in `evidence_trace`.
+- Duplicate scenario or service rows are invalid. Conflicting conclusions must use `knowledge_conflicts`, not duplicate rows with different statuses.
+- For a multi-service review, `source_of_truth` must name one of the reviewed services.
 - Keep unknown information in `open_questions`; do not silently fill it.

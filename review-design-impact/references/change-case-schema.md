@@ -74,6 +74,13 @@ Use this schema to extract historical design facts. Preserve evidence for every 
       "source": "订单状态",
       "type": "controls",
       "target": "支付许可",
+      "direction": "forward",
+      "propagation": "bidirectional",
+      "conditions": ["订单处于可支付状态"],
+      "version_scope": {
+        "from": "V2",
+        "to": null
+      },
       "evidence": {
         "section": "业务规则",
         "kind": "explicit"
@@ -92,10 +99,20 @@ Use this schema to extract historical design facts. Preserve evidence for every 
   ],
   "conflicts": [],
   "uncertain_fields": [],
+  "extraction": {
+    "run_id": "extract-20260722-order-freeze-v2",
+    "executor": "codex-review-design-impact",
+    "completed_at": "2026-07-22T09:00:00+08:00"
+  },
   "validation": {
     "status": "validated",
     "confidence": "high",
     "method": "independent-source-reread",
+    "run_id": "review-20260722-order-freeze-v2",
+    "reviewer": "codex-review-design-impact-pass-2",
+    "reviewed_at": "2026-07-22T09:15:00+08:00",
+    "source_sha256": "document-sha256",
+    "independent_context": true,
     "issues": [],
     "verified_fields": [
       "business_objects",
@@ -120,6 +137,9 @@ Use this schema to extract historical design facts. Preserve evidence for every 
 - Put unresolved or contradictory extraction results in `uncertain_fields`.
 - Put competing conclusions in `conflicts`; never discard one side by majority count.
 - Independently reread the source and populate `validation` after the first extraction pass.
+- For every relation, record evidence direction separately from impact propagation. `direction` is `forward` or `bidirectional`; `propagation` is `forward`, `reverse`, `bidirectional`, or `none`. Preserve applicability in `conditions` and document/version limits in `version_scope`.
+- Give extraction and validation different run IDs. Start pass 2 from the source document and the schema, without using pass-1 conclusions as the review context.
+- Record extractor, reviewer, completion times, the exact source hash, and the fields checked. These fields are compilation gates, not optional comments.
 
 ## Validation statuses
 
@@ -162,3 +182,5 @@ Use confidence `high`, `medium`, or `low`. A validated case containing only infe
 ## Validation minimum
 
 Every case must contain non-empty `case_id`, `title`, `source.path`, `source.sha256`, `business_objects`, `change_types`, `validation.status`, `validation.confidence`, and at least one of `scenarios` or `service_changes`. Every scenario and service change must contain evidence kind and source location. `source.sha256` allows the skill to refresh only documents that changed.
+
+A `validated` case is trusted only when `extraction.run_id`, `extraction.executor`, `extraction.completed_at`, `validation.run_id`, `validation.reviewer`, `validation.reviewed_at`, `validation.source_sha256`, `validation.independent_context=true`, and non-empty `validation.verified_fields` are present; extraction and review run IDs must differ, and the reviewed hash must equal `source.sha256`. The compiler rejects promotion when these checks fail. This records independent execution, but it still cannot prove that a model truly ignored prior conclusions; high-risk knowledge remains eligible for human review.

@@ -24,6 +24,41 @@ def run_script(name: str, *args: str) -> subprocess.CompletedProcess[str]:
 
 
 class PipelineTest(unittest.TestCase):
+    def test_non_design_decision_prevents_repeated_extraction(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_temp:
+            root = Path(raw_temp)
+            notes = root / "ordinary-name.txt"
+            notes.write_text("local developer environment settings", encoding="utf-8")
+            initial = run_script("workspace_state.py", "--workspace", str(root))
+            self.assertEqual(initial.returncode, 0, initial.stderr)
+            state = root / ".design-impact"
+            session = json.loads((state / "session.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(session["pending_extraction"]), 1)
+            digest = hashlib.sha256(notes.read_bytes()).hexdigest()
+            (state / "document-decisions.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "documents": [
+                            {
+                                "path": str(notes),
+                                "sha256": digest,
+                                "classification": "non-design",
+                                "reason": "environment notes only",
+                                "reviewed_at": "2026-07-22T10:00:00+00:00",
+                                "reviewer": "pipeline-test",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            refreshed = run_script("workspace_state.py", "--workspace", str(root))
+            self.assertEqual(refreshed.returncode, 0, refreshed.stderr)
+            session = json.loads((state / "session.json").read_text(encoding="utf-8"))
+            self.assertEqual(session["pending_extraction"], [])
+            self.assertEqual(session["non_design_document_count"], 1)
+
     def test_local_history_pipeline(self) -> None:
         with tempfile.TemporaryDirectory() as raw_temp:
             root = Path(raw_temp)
@@ -42,7 +77,7 @@ class PipelineTest(unittest.TestCase):
             session = json.loads((state / "session.json").read_text(encoding="utf-8"))
             self.assertEqual(session["document_count"], 1)
             self.assertEqual(len(session["pending_extraction"]), 1)
-            self.assertEqual(session["discovery_mode"], "design-name-or-directory")
+            self.assertEqual(session["discovery_mode"], "all-supported-documents")
 
             manifest = root / "manifest.json"
             inventory = run_script(
@@ -95,14 +130,40 @@ class PipelineTest(unittest.TestCase):
                         "evidence": {"kind": "explicit", "section": "服务改造"},
                     },
                 ],
-                "relations": [],
+                "relations": [
+                    {
+                        "source": "订单状态",
+                        "type": "controls",
+                        "target": "支付许可",
+                        "direction": "forward",
+                        "propagation": "bidirectional",
+                        "conditions": ["订单处于可支付状态"],
+                        "version_scope": {"from": "V1"},
+                        "evidence": {"kind": "explicit", "section": "业务规则"},
+                    }
+                ],
                 "historical_omissions": [],
                 "conflicts": [],
                 "uncertain_fields": [],
+                "extraction": {
+                    "run_id": "extract-order-freeze-v1",
+                    "executor": "pipeline-test-extractor",
+                    "completed_at": "2026-07-22T09:00:00+00:00",
+                },
                 "validation": {
                     "status": "validated",
                     "confidence": "high",
                     "method": "independent-source-reread",
+                    "run_id": "review-order-freeze-v1",
+                    "reviewer": "pipeline-test-reviewer",
+                    "reviewed_at": "2026-07-22T09:10:00+00:00",
+                    "source_sha256": source_hash,
+                    "independent_context": True,
+                    "verified_fields": [
+                        "business_objects",
+                        "scenarios",
+                        "service_changes",
+                    ],
                     "issues": [],
                 },
             }
@@ -174,6 +235,8 @@ class PipelineTest(unittest.TestCase):
                 str(cases),
                 "--output",
                 str(database),
+                "--manifest",
+                str(state / "manifest.json"),
             )
             self.assertEqual(compile_result.returncode, 0, compile_result.stderr)
             quality = json.loads(
@@ -248,6 +311,18 @@ class PipelineTest(unittest.TestCase):
                             "kind": "codegraph-mcp",
                             "mcp_call_id": "cg-0001",
                         },
+                    },
+                    {
+                        "id": "order-service:Order.status",
+                        "type": "field",
+                        "name": "Order.status",
+                        "service": "order-service",
+                        "repository": "order-service",
+                        "location": {"file": "src/domain/Order.java", "line": 18},
+                        "evidence": {
+                            "kind": "codegraph-mcp",
+                            "mcp_call_id": "cg-0001",
+                        },
                     }
                 ],
                 "relations": [
@@ -281,6 +356,22 @@ class PipelineTest(unittest.TestCase):
                 json.dumps(code_export, ensure_ascii=False), encoding="utf-8"
             )
             code_database = state / "code-facts.db"
+            dangling_export = json.loads(json.dumps(code_export))
+            dangling_export["relations"][0]["target_id"] = "missing:Order.status"
+            dangling_export["business_mappings"][0]["asset_id"] = "missing:job"
+            dangling_path = capture_dir / "dangling.json"
+            dangling_path.write_text(json.dumps(dangling_export), encoding="utf-8")
+            dangling_compile = run_script(
+                "compile_code_facts.py",
+                "--input",
+                str(dangling_path),
+                "--output",
+                str(state / "dangling.db"),
+            )
+            self.assertEqual(dangling_compile.returncode, 1)
+            self.assertIn("undeclared", dangling_compile.stderr)
+            self.assertIn("not a declared entity", dangling_compile.stderr)
+
             code_compile = run_script(
                 "compile_code_facts.py",
                 "--input",
@@ -377,11 +468,18 @@ class PipelineTest(unittest.TestCase):
                 str(spec_path),
                 "--output",
                 str(impact_path),
+                "--code-db",
+                str(code_database),
             )
             self.assertEqual(impact_result.returncode, 0, impact_result.stderr)
             impact = json.loads(impact_path.read_text(encoding="utf-8"))
             self.assertEqual(impact["scan"]["total_cases"], 2)
             self.assertEqual(impact["scan"]["matched_cases"], 2)
+            self.assertTrue(impact["scan"]["code_snapshot_used"])
+            self.assertGreaterEqual(len(impact["code_impacts"]), 1)
+            historical_paths = impact["graph_propagation"]["historical_paths"]
+            self.assertTrue(historical_paths[0]["relation_id"].startswith("history-relation:"))
+            self.assertEqual(historical_paths[0]["propagation"], "bidirectional")
             self.assertEqual(len(impact["historical_scenarios"]), 2)
             self.assertEqual(len(impact["candidate_services"]), 3)
             self.assertEqual(len(impact["historical_conflicts"]), 1)
@@ -391,6 +489,53 @@ class PipelineTest(unittest.TestCase):
                 if item["scenario"] == "冻结与支付并发"
             )
             self.assertEqual(trusted_scenario["knowledge_tier"], "trusted")
+
+            replay_dataset = {
+                "defaults": {
+                    "history_db": str(database),
+                    "code_db": str(code_database),
+                },
+                "thresholds": {
+                    "scenario_recall": 1.0,
+                    "service_recall": 1.0,
+                    "evidence_precision": 1.0,
+                },
+                "cases": [
+                    {
+                        "id": "order-freeze-replay",
+                        "change_spec": str(spec_path),
+                        "expected_scenarios": [
+                            item["scenario"] for item in impact["historical_scenarios"]
+                        ],
+                        "expected_services": [
+                            item["service"] for item in impact["candidate_services"]
+                        ],
+                        "expected_evidence": [
+                            {
+                                "scenario": item["scenario"],
+                                "case_ids": item["case_ids"],
+                            }
+                            for item in impact["historical_scenarios"]
+                        ],
+                    }
+                ],
+            }
+            replay_path = root / "replay.json"
+            replay_path.write_text(
+                json.dumps(replay_dataset, ensure_ascii=False), encoding="utf-8"
+            )
+            replay_output = root / "replay-result.json"
+            replay = run_script(
+                "evaluate_replay.py",
+                "--dataset",
+                str(replay_path),
+                "--output",
+                str(replay_output),
+            )
+            self.assertEqual(replay.returncode, 0, replay.stderr)
+            replay_result = json.loads(replay_output.read_text(encoding="utf-8"))
+            self.assertTrue(replay_result["passed"])
+            self.assertEqual(replay_result["overall"]["scenarios"]["recall"], 1.0)
 
             review = {
                 "change_spec": spec,
@@ -431,7 +576,7 @@ class PipelineTest(unittest.TestCase):
                         "requires_confirmation": False,
                         "modifications": ["增加冻结状态"],
                         "tests": ["状态迁移"],
-                        "evidence": [{"type": "historical"}],
+                        "evidence": [{"type": "historical", "case_id": "order-freeze-v1"}],
                     },
                     {
                         "service": "payment-service",
@@ -441,7 +586,7 @@ class PipelineTest(unittest.TestCase):
                         "requires_confirmation": False,
                         "modifications": ["拒绝冻结订单支付"],
                         "tests": ["冻结后支付"],
-                        "evidence": [{"type": "historical"}],
+                        "evidence": [{"type": "historical", "case_id": "order-freeze-v1"}],
                     },
                 ],
                 "cross_service_review": {
@@ -469,6 +614,97 @@ class PipelineTest(unittest.TestCase):
             review_path.write_text(json.dumps(review, ensure_ascii=False), encoding="utf-8")
             validation = run_script("validate_review.py", "--input", str(review_path))
             self.assertEqual(validation.returncode, 0, validation.stdout + validation.stderr)
+            invalid_review = json.loads(json.dumps(review))
+            invalid_review["service_modifications"][0]["evidence"] = [
+                {"type": "historical"}
+            ]
+            invalid_review_path = root / "invalid-review.json"
+            invalid_review_path.write_text(json.dumps(invalid_review), encoding="utf-8")
+            rejected_review = run_script(
+                "validate_review.py", "--input", str(invalid_review_path)
+            )
+            self.assertEqual(rejected_review.returncode, 1)
+            self.assertIn("case_id is required", rejected_review.stdout)
+
+    def test_reconcile_case_move_and_change(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_temp:
+            root = Path(raw_temp)
+            docs = root / "docs"
+            cases = root / ".design-impact" / "cases"
+            docs.mkdir(parents=True)
+            cases.mkdir(parents=True)
+            old_path = docs / "old-design.md"
+            new_path = docs / "renamed-design.md"
+            old_path.write_text("stable design", encoding="utf-8")
+            digest = hashlib.sha256(old_path.read_bytes()).hexdigest()
+            manifest_before = root / "manifest-before.json"
+            first_inventory = run_script(
+                "inventory_documents.py",
+                "--root",
+                str(docs),
+                "--output",
+                str(manifest_before),
+            )
+            self.assertEqual(first_inventory.returncode, 0, first_inventory.stderr)
+            case_path = cases / "case.json"
+            case_path.write_text(
+                json.dumps(
+                    {
+                        "case_id": "move-case",
+                        "source": {"path": str(old_path), "sha256": digest},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            old_path.rename(new_path)
+            manifest_after = root / "manifest-after.json"
+            second_inventory = run_script(
+                "inventory_documents.py",
+                "--root",
+                str(docs),
+                "--output",
+                str(manifest_after),
+                "--previous",
+                str(manifest_before),
+            )
+            self.assertEqual(second_inventory.returncode, 0, second_inventory.stderr)
+            delta = json.loads(manifest_after.read_text(encoding="utf-8"))["delta"]
+            self.assertEqual(len(delta["moved"]), 1)
+            self.assertEqual(delta["added"], [])
+            self.assertEqual(delta["removed"], [])
+
+            reconciled = run_script(
+                "reconcile_cases.py",
+                "--cases",
+                str(cases),
+                "--manifest",
+                str(manifest_after),
+            )
+            self.assertEqual(reconciled.returncode, 0, reconciled.stderr)
+            migrated_case = json.loads(case_path.read_text(encoding="utf-8"))
+            self.assertEqual(Path(migrated_case["source"]["path"]), new_path.resolve())
+
+            new_path.write_text("changed design", encoding="utf-8")
+            changed_manifest = root / "manifest-changed.json"
+            changed_inventory = run_script(
+                "inventory_documents.py",
+                "--root",
+                str(docs),
+                "--output",
+                str(changed_manifest),
+                "--previous",
+                str(manifest_after),
+            )
+            self.assertEqual(changed_inventory.returncode, 0, changed_inventory.stderr)
+            removed_stale = run_script(
+                "reconcile_cases.py",
+                "--cases",
+                str(cases),
+                "--manifest",
+                str(changed_manifest),
+            )
+            self.assertEqual(removed_stale.returncode, 0, removed_stale.stderr)
+            self.assertFalse(case_path.exists())
 
 
 if __name__ == "__main__":

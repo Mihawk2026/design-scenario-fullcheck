@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-from inventory_documents import DEFAULT_EXTENSIONS, scan_root
+from inventory_documents import DEFAULT_EXTENSIONS, detect_moves, scan_root
 
 
 DESIGN_TOKENS = {
@@ -46,6 +46,17 @@ EXCLUDED_PARTS = {
     "coverage",
     "__pycache__",
     "review-design-impact",
+}
+
+NON_DESIGN_FILENAMES = {
+    "license.md",
+    "manifest.json",
+    "package-lock.json",
+    "package.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "composer.json",
+    "composer.lock",
 }
 
 
@@ -84,6 +95,19 @@ def load_manifest(path: Path) -> dict[str, Any]:
         return value if isinstance(value, dict) else {}
     except (OSError, UnicodeError, json.JSONDecodeError):
         return {}
+
+
+def load_non_design_decisions(path: Path) -> set[tuple[str, str]]:
+    payload = load_manifest(path)
+    decisions: set[tuple[str, str]] = set()
+    for document in payload.get("documents", []):
+        if not isinstance(document, dict) or document.get("classification") != "non-design":
+            continue
+        source_path = document.get("path")
+        digest = document.get("sha256")
+        if isinstance(source_path, str) and isinstance(digest, str):
+            decisions.add((normalize_path(source_path), digest.casefold()))
+    return decisions
 
 
 def git_value(repository: Path, *arguments: str) -> str | None:
@@ -318,20 +342,16 @@ def main() -> int:
                 all_documents.append(document)
                 seen.add(key)
 
-    design_documents = [item for item in all_documents if item["design_score"] > 0]
     if explicit_roots:
         selected = all_documents
         discovery_mode = "explicit-roots"
-    elif design_documents:
-        selected = design_documents
-        discovery_mode = "design-name-or-directory"
     else:
         selected = [
             item
             for item in all_documents
-            if Path(item["path"]).name.casefold() not in {"readme.md", "license.md"}
+            if Path(item["path"]).name.casefold() not in NON_DESIGN_FILENAMES
         ]
-        discovery_mode = "fallback-all-supported-documents"
+        discovery_mode = "all-supported-documents"
 
     selected.sort(key=lambda item: item["path"].casefold())
     manifest_path = state_dir / "manifest.json"
@@ -343,11 +363,16 @@ def main() -> int:
     }
     current_docs = {normalize_path(item["path"]): item for item in selected}
 
+    added_keys = current_docs.keys() - previous_docs.keys()
+    removed_keys = previous_docs.keys() - current_docs.keys()
+    moved = detect_moves(current_docs, previous_docs, set(added_keys), set(removed_keys))
+    moved_from = {normalize_path(item["from"]) for item in moved}
+    moved_to = {normalize_path(item["to"]) for item in moved}
     added = sorted(
-        current_docs[key]["path"] for key in current_docs.keys() - previous_docs.keys()
+        current_docs[key]["path"] for key in added_keys if key not in moved_to
     )
     removed = sorted(
-        previous_docs[key]["path"] for key in previous_docs.keys() - current_docs.keys()
+        previous_docs[key]["path"] for key in removed_keys if key not in moved_from
     )
     changed = sorted(
         current_docs[key]["path"]
@@ -372,6 +397,7 @@ def main() -> int:
             "changed": changed,
             "unchanged": unchanged,
             "removed": removed,
+            "moved": moved,
         },
         "errors": errors,
     }
@@ -382,11 +408,14 @@ def main() -> int:
     extracted, validation_states, case_errors, case_file_count = extracted_sources(
         cases_dir
     )
+    non_design = load_non_design_decisions(state_dir / "document-decisions.json")
     pending = [
         document
         for document in selected
         if document["sha256"].casefold()
         not in extracted.get(normalize_path(document["path"]), set())
+        and (normalize_path(document["path"]), document["sha256"].casefold())
+        not in non_design
     ]
     pending_validation = [
         document
@@ -424,10 +453,12 @@ def main() -> int:
         "state_dir": str(state_dir),
         "discovery_mode": discovery_mode,
         "document_count": len(selected),
+        "non_design_document_count": len(non_design),
         "case_file_count": case_file_count,
         "pending_extraction": pending,
         "pending_validation": pending_validation,
         "removed_documents": removed,
+        "moved_documents": moved,
         "needs_compile": needs_compile,
         "history_db": str(database),
         "history_db_exists": database.is_file(),
